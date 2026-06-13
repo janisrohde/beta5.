@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="theme-color" content="#F2F2F7">
+    <title>Anmelden – Einkaufsliste</title>
+    <link rel="manifest" href="manifest.json">
+    <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
+    <link rel="icon" type="image/png" sizes="16x16" href="favicon-16.png">
+    <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app-container">
+        <header class="app-header">
+            <div class="header-icon">
+                <div class="header-app-icon">
+                    <img src="apple-touch-icon.png" alt="">
+                </div>
+            </div>
+            <h1>Einkaufsliste</h1>
+            <p class="subtitle">Melde dich an, um loszulegen</p>
+        </header>
+
+        <main class="main-content">
+            <div class="auth-tabs">
+                <button class="auth-tab active" id="loginTab">Anmelden</button>
+                <button class="auth-tab" id="registerTab">Registrieren</button>
+            </div>
+
+            <div id="authError" class="auth-error" role="alert" style="display:none;"></div>
+
+            <!-- Login Formular -->
+            <div class="auth-card" id="loginForm">
+                <div class="input-group">
+                    <label for="loginUsername">Benutzername</label>
+                    <input type="text" id="loginUsername" placeholder="Benutzername eingeben"
+                           autocomplete="username" autocorrect="off" autocapitalize="none" spellcheck="false">
+                </div>
+                <div class="input-group" style="margin-top:14px;">
+                    <label for="loginPassword">Passwort</label>
+                    <input type="password" id="loginPassword" placeholder="Passwort eingeben"
+                           autocomplete="current-password">
+                </div>
+                <button class="btn btn-primary" id="loginBtn" style="margin-top:20px;width:100%;">
+                    Anmelden
+                </button>
+            </div>
+
+            <!-- Registrierungs-Formular -->
+            <div class="auth-card" id="registerForm" style="display:none;">
+                <div class="input-group">
+                    <label for="registerUsername">Benutzername</label>
+                    <input type="text" id="registerUsername" placeholder="Benutzername wählen"
+                           autocomplete="username" autocorrect="off" autocapitalize="none" spellcheck="false">
+                </div>
+                <div class="input-group" style="margin-top:14px;">
+                    <label for="registerPassword">Passwort</label>
+                    <input type="password" id="registerPassword" placeholder="Mind. 6 Zeichen"
+                           autocomplete="new-password">
+                </div>
+                <div class="input-group" style="margin-top:14px;">
+                    <label for="registerPasswordConfirm">Passwort bestätigen</label>
+                    <input type="password" id="registerPasswordConfirm" placeholder="Passwort wiederholen"
+                           autocomplete="new-password">
+                </div>
+                <button class="btn btn-primary" id="registerBtn" style="margin-top:20px;width:100%;">
+                    Konto erstellen
+                </button>
+            </div>
+        </main>
+    </div>
+
+    <script type="module" src="auth.js"></script>
+</body>
+</html>
