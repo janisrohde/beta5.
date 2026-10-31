@@ -18,9 +18,10 @@ import {
     writeBatch,
     increment
 } from "https://www.gstatic.com/firebasejs/13.1.0/firebase-firestore.js";
-import { initVoice } from "./voice.js?v=2.0.3";
+import { initVoice } from "./voice.js?v=2.0.4";
+import { photoKey } from "./photo-key.js?v=2.0.4";
 
-export const APP_VERSION = '2.0.3';
+export const APP_VERSION = '2.0.4';
 
 // Alte, zwischengespeicherte HTML-Seite (vor Version 2) erkennen: Service Worker
 // und Caches einmalig leeren und frisch laden, damit HTML und Skript zusammenpassen.
@@ -619,6 +620,8 @@ function bumpCount(listId, n) {
         .catch(e => Debug.log('Zähler', e));
 }
 
+const imageCache = new Map();
+
 // ===== APP STATE =====
 const PRODUCT_TRASH_DAYS = 7;
 const LIST_TRASH_DAYS = 30;
@@ -722,9 +725,11 @@ const AppState = {
         const autoCategory = category === 'sonstiges' ? detectCategory(name) : category;
         const ref = doc(collection(db, "lists", listId, "products"));
         const isDataImage = imageUrl && String(imageUrl).startsWith('data:');
+        const key = photoKey(name);
         const batch = writeBatch(db);
         batch.set(ref, {
             name: name.trim(),
+            photoKey: key,
             category: autoCategory,
             checked: false,
             imageUrl: isDataImage ? null : (imageUrl || null),
@@ -739,9 +744,32 @@ const AppState = {
         if (isDataImage) {
             batch.set(doc(db, "lists", listId, "productImages", ref.id), { data: imageUrl, createdAt: serverTimestamp() });
         }
+        // Foto-Gedächtnis: neues Foto merken, sonst ein früheres Foto gleichen Namens zurückholen
+        if (imageUrl) {
+            batch.set(doc(db, "lists", listId, "photoMemory", key), { name: name.trim(), data: imageUrl, updatedAt: serverTimestamp() });
+        }
         commitQuietly(batch, 'Produkt hinzufügen');
         bumpCount(listId, 1);
+        if (!imageUrl) this.attachRememberedPhoto(listId, ref.id, name);
         return ref.id;
+    },
+
+    // Sucht im Foto-Gedächtnis dieser Liste (und der anderen Familienlisten) ein Foto
+    // zum Produktnamen und hängt es an. Gibt true zurück, wenn eins gefunden wurde.
+    async attachRememberedPhoto(listId, productId, name, { onlyThisList = false } = {}) {
+        const key = photoKey(name);
+        const others = onlyThisList ? [] : (Mirror.get('lists_' + currentFamilyId) || [])
+            .filter(l => !l.deletedAt && l.id !== listId).map(l => l.id);
+        for (const id of [listId, ...others].slice(0, 12)) {
+            try {
+                const snap = await getDoc(doc(db, "lists", id, "photoMemory", key));
+                if (snap.exists()) {
+                    this.updateProduct(listId, productId, { hasImage: true, photoKey: key, photoListId: id });
+                    return true;
+                }
+            } catch (e) { /* offline: später erneut */ }
+        }
+        return false;
     },
 
     updateProduct(listId, productId, fields) {
@@ -772,9 +800,19 @@ const AppState = {
 
     async loadImage(listId, product) {
         if (product.imageUrl) return product.imageUrl;
+        if (imageCache.has(product.id)) return imageCache.get(product.id);
         try {
-            const snap = await getDoc(doc(db, "lists", listId, "productImages", product.id));
-            return snap.exists() ? snap.data().data : null;
+            let src = null;
+            if (!product.photoListId) {
+                const snap = await getDoc(doc(db, "lists", listId, "productImages", product.id));
+                src = snap.exists() ? snap.data().data : null;
+            }
+            if (!src) {
+                const mem = await getDoc(doc(db, "lists", product.photoListId || listId, "photoMemory", product.photoKey || photoKey(product.name)));
+                src = mem.exists() ? mem.data().data : null;
+            }
+            if (src) imageCache.set(product.id, src);
+            return src;
         } catch (e) {
             Debug.log('Foto laden', e);
             return null;
@@ -1174,34 +1212,51 @@ async function ensureMembership() {
 }
 
 // ===== NEUE VERSION – NEU LADEN =====
+// ===== AUTOMATISCHE UPDATES (wie Streak-App) =====
+// Die App fragt beim Start, alle 3 Minuten und beim Zurückkehren nach version.json.
+// Gibt es eine neue Version und ist gerade kein Fenster offen, lädt sie sich mit
+// kurzem Ladebildschirm selbst neu. Während einer Eingabe wird gewartet.
+let lastUpdateCheck = 0;
+async function checkForUpdate() {
+    lastUpdateCheck = Date.now();
+    try {
+        const res = await fetch(`version.json?t=${Date.now()}`, { cache: 'no-store' });
+        if (!res.ok) return;
+        const { version } = await res.json();
+        if (!version || version === APP_VERSION) return;
+        const busy = document.querySelector('.modal-overlay.active, .voice-panel.active, .scanner-overlay.active, #undo-bar')
+            || (document.activeElement?.tagName === 'INPUT' && document.activeElement.value);
+        if (busy) { setTimeout(checkForUpdate, 20000); return; }
+        showUpdateScreen();
+        try {
+            const keys = await caches.keys();
+            await Promise.all(keys.map(k => caches.delete(k)));
+            const regs = await navigator.serviceWorker?.getRegistrations?.() || [];
+            await Promise.all(regs.map(r => r.update().catch(() => {})));
+        } catch (e) {}
+        const url = new URL(location.href);
+        url.searchParams.set('v', version);
+        location.replace(url.toString());
+    } catch (e) { /* offline – später erneut */ }
+}
+
+function showUpdateScreen() {
+    if (document.getElementById('update-screen')) return;
+    const el = document.createElement('div');
+    el.id = 'update-screen';
+    el.className = 'update-screen';
+    el.innerHTML = `<img src="apple-touch-icon.png" alt=""><div class="update-spinner"></div><p>Neue Version wird geladen …</p>`;
+    document.body.appendChild(el);
+}
+
 function registerServiceWorker() {
-    if (!('serviceWorker' in navigator)) return;
-    navigator.serviceWorker.register('sw.js').then((reg) => {
-        const offer = (worker) => {
-            if (!worker || !navigator.serviceWorker.controller) return;
-            if (document.getElementById('update-banner')) return;
-            const banner = document.createElement('div');
-            banner.id = 'update-banner';
-            banner.className = 'update-banner';
-            banner.innerHTML = `<span>Neue Version verfügbar</span><button type="button">Neu laden</button>`;
-            banner.querySelector('button').addEventListener('click', () => worker.postMessage('SKIP_WAITING'));
-            document.body.appendChild(banner);
-        };
-        if (reg.waiting) offer(reg.waiting);
-        reg.addEventListener('updatefound', () => {
-            const w = reg.installing;
-            w?.addEventListener('statechange', () => { if (w.state === 'installed') offer(w); });
-        });
-        // Beim Zurückkehren in die App nach Updates schauen
-        document.addEventListener('visibilitychange', () => {
-            if (document.visibilityState === 'visible') reg.update().catch(() => {});
-        });
-    }).catch(e => Debug.log('Service Worker', e));
-    let reloading = false;
-    navigator.serviceWorker.addEventListener('controllerchange', () => {
-        if (reloading) return;
-        reloading = true;
-        location.reload();
+    if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('sw.js').catch(e => Debug.log('Service Worker', e));
+    }
+    setTimeout(checkForUpdate, 4000);
+    setInterval(checkForUpdate, 3 * 60 * 1000);
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible' && Date.now() - lastUpdateCheck > 20000) checkForUpdate();
     });
 }
 
@@ -1661,9 +1716,9 @@ if (isListPage) {
             </span>
             <span class="product-name pname"></span>
             <span class="product-qty"></span>
-            <button class="photo-link-btn" type="button" hidden>
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
-                Foto
+            <button class="photo-link-btn photo-thumb" type="button" hidden aria-label="Foto ansehen">
+                <img alt="" hidden>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
             </button>`;
     }
 
@@ -1744,6 +1799,7 @@ if (isListPage) {
                     row.querySelector('.photo-link-btn').hidden = !hasImage;
                     row.setAttribute('aria-label', `${p.name}${p.qty ? ' ' + p.qty : ''} abhaken`);
                 }
+                if (hasImage) loadThumb(row, p);
                 if (listEl.children[i] !== row) listEl.insertBefore(row, listEl.children[i] || null);
             });
         });
@@ -1752,6 +1808,35 @@ if (isListPage) {
         // Zeilen, die gerade abgehakt animiert werden, dürfen zu Ende laufen
         rows.forEach(el => { if (!el.classList.contains('checking')) el.remove(); });
         updateProgress();
+    }
+
+    // Vorschaubild in der Zeile nachladen (einmal pro Produkt, danach aus dem Zwischenspeicher)
+    function loadThumb(row, product) {
+        const img = row.querySelector('.photo-thumb img');
+        const marker = product.id + '|' + (product.photoKey || '') + '|' + (product.photoListId || '');
+        if (!img || img.dataset.for === marker) return;
+        img.dataset.for = marker;
+        AppState.loadImage(currentListId, product).then((src) => {
+            if (!src) { img.dataset.for = ''; return; }
+            img.src = src;
+            img.hidden = false;
+            row.querySelector('.photo-thumb svg')?.setAttribute('hidden', '');
+        });
+    }
+
+    // Einmal am Tag: Produkte ohne Foto bekommen ihr früheres Foto aus dem Gedächtnis zurück
+    let photosRestored = false;
+    function restoreRememberedPhotos() {
+        if (photosRestored) return;
+        photosRestored = true;
+        const today = new Date().toISOString().slice(0, 10);
+        const flag = 'photos_checked_' + currentListId;
+        if (localStorage.getItem(flag) === today) return;
+        localStorage.setItem(flag, today);
+        currentProducts
+            .filter(p => !p.hasImage && !p.imageUrl)
+            .slice(0, 40)
+            .forEach(p => AppState.attachRememberedPhoto(currentListId, p.id, p.name, { onlyThisList: true }));
     }
 
     function updateProgress() {
@@ -1876,7 +1961,7 @@ if (isListPage) {
         }
         allProducts = products;
         currentProducts = active;
-        if (!fromCache) serverConfirmed = true;
+        if (!fromCache) { serverConfirmed = true; restoreRememberedPhotos(); }
         setSyncHint(syncHint, fromCache);
         renderList();
 

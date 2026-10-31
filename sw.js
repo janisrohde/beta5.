@@ -2,8 +2,8 @@
 // - HTML: zuerst aus dem Netz (max. 3 s), sonst aus dem Cache → nie veraltete Seiten
 // - CSS/JS/Bilder: versioniert (?v=…) aus dem Cache
 // - Firestore, Google-Fonts usw. werden nie abgefangen
-// - Kein automatisches skipWaiting: die Seite zeigt „Neue Version – Neu laden“
-const VERSION = '2.0.3';
+// - Updates: die Seite prüft version.json und lädt sich selbst neu (wie Streak-App)
+const VERSION = '2.0.4';
 const CACHE_NAME = 'einkaufsliste-v8-' + VERSION;
 const CORE = [
     './',
@@ -14,6 +14,7 @@ const CORE = [
     `script.js?v=${VERSION}`,
     `voice.js?v=${VERSION}`,
     `voice-parser.js?v=${VERSION}`,
+    `photo-key.js?v=${VERSION}`,
     `auth.js?v=${VERSION}`,
     'manifest.json',
     'apple-touch-icon.png',
@@ -22,6 +23,7 @@ const CORE = [
 ];
 
 self.addEventListener('install', (event) => {
+    self.skipWaiting();
     event.waitUntil(
         caches.open(CACHE_NAME).then((cache) =>
             Promise.all(CORE.map(url => cache.add(new Request(url, { cache: 'reload' })).catch(() => {})))
@@ -78,6 +80,7 @@ self.addEventListener('fetch', (event) => {
     if (request.method !== 'GET') return;
     const url = new URL(request.url);
     if (url.origin !== self.location.origin) return; // Firestore, CDN, Fonts: nicht anfassen
+    if (url.pathname.endsWith('version.json')) return; // immer frisch vom Server
 
     const isPage = request.mode === 'navigate' || request.destination === 'document' || url.pathname.endsWith('.html');
     event.respondWith(isPage ? networkFirst(request) : cacheFirst(request));
