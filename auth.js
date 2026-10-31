@@ -6,7 +6,6 @@ import {
     getDoc,
     getDocs,
     setDoc,
-    writeBatch,
     serverTimestamp,
     query,
     where
@@ -230,16 +229,15 @@ async function doRegister() {
         const uid = crypto.randomUUID();
 
         try { await signInGuest(); } catch (e) { /* Gast-Anmeldung noch nicht eingeschaltet */ }
-        const batch = writeBatch(db);
-        batch.set(doc(db, 'users', uid), {
+        await setDoc(doc(db, 'users', uid), {
             username: username.toLowerCase(),
             displayName: username,
             passwordHash: hash,
             familyId: uid,
             createdAt: new Date().toISOString()
         });
-        batch.set(doc(db, 'usernames', username.toLowerCase()), { userId: uid, familyId: uid });
-        await batch.commit();
+        // Benutzernamen-Verzeichnis (für spätere sichere Regeln) – darf nie die Registrierung verhindern
+        setDoc(doc(db, 'usernames', username.toLowerCase()), { userId: uid, familyId: uid }).catch(() => {});
         joinFamily(uid, uid, username.toLowerCase(), hash).catch(() => {});
 
         const SESSION_DAYS = 30;
