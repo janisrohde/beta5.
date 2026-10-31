@@ -1,13 +1,16 @@
-import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { initializeApp } from "https://www.gstatic.com/firebasejs/13.1.0/firebase-app.js";
 import {
     getFirestore,
     collection,
     doc,
+    getDoc,
     getDocs,
     setDoc,
+    writeBatch,
+    serverTimestamp,
     query,
     where
-} from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+} from "https://www.gstatic.com/firebasejs/13.1.0/firebase-firestore.js";
 
 const firebaseConfig = {
     apiKey: "AIzaSyDN17KahTrjPxIM2BfBSSJxou5y6U6PZHY",
@@ -25,6 +28,52 @@ const db = getFirestore(app);
 const _session = JSON.parse(localStorage.getItem('auth_session') || 'null');
 if (_session && _session.familyId) {
     window.location.href = 'index.html';
+}
+
+// Gast-Anmeldung bei Firebase (für die sicheren Regeln). Ist sie in Firebase nicht
+// eingeschaltet, geht der Login wie bisher weiter.
+async function signInGuest() {
+    const { getAuth, signInAnonymously, onAuthStateChanged } = await import("https://www.gstatic.com/firebasejs/13.1.0/firebase-auth.js");
+    const auth = getAuth(app);
+    const existing = await new Promise((resolve) => {
+        const unsub = onAuthStateChanged(auth, (u) => { unsub(); resolve(u); });
+    });
+    return existing || (await signInAnonymously(auth)).user;
+}
+
+// Gerät als Mitglied der Familie eintragen; die Regeln prüfen den Passwort-Hash
+async function joinFamily(familyId, userId, username, hash) {
+    const user = await signInGuest();
+    await setDoc(doc(db, 'families', familyId, 'members', user.uid), {
+        userId, username, proof: hash, joinedAt: serverTimestamp(), device: navigator.userAgent.slice(0, 120)
+    }, { merge: true });
+    localStorage.setItem(`member_${user.uid}_${familyId}`, '1');
+}
+
+// Konto finden: erst wie bisher (solange die Regeln offen sind), sonst über das
+// Benutzernamen-Verzeichnis – dann prüfen die Firestore-Regeln das Passwort.
+async function findAccount(username, hash) {
+    const name = username.toLowerCase();
+    try {
+        const snap = await getDocs(query(collection(db, 'users'), where('username', '==', name)));
+        if (snap.empty) return { status: 'unknown' };
+        const data = snap.docs[0].data();
+        if (data.passwordHash !== hash) return { status: 'wrong' };
+        joinFamily(data.familyId, snap.docs[0].id, data.username, hash).catch(() => {});
+        return { status: 'ok', userId: snap.docs[0].id, username: data.username, displayName: data.displayName || data.username, familyId: data.familyId };
+    } catch (e) {
+        if (e.code !== 'permission-denied') throw e;
+    }
+    const entry = await getDoc(doc(db, 'usernames', name));
+    if (!entry.exists()) return { status: 'unknown' };
+    const { userId, familyId } = entry.data();
+    try {
+        await joinFamily(familyId, userId, name, hash);
+    } catch (e) {
+        if (e.code === 'permission-denied') return { status: 'wrong' };
+        throw e;
+    }
+    return { status: 'ok', userId, username: name, displayName: username, familyId };
 }
 
 // Passwort mit SHA-256 hashen (Benutzername als Salt)
@@ -120,19 +169,9 @@ async function doLogin() {
     setBtn('loginBtn', 'Anmelden…', true);
 
     try {
-        const snap = await getDocs(query(collection(db, 'users'), where('username', '==', username.toLowerCase())));
-        if (snap.empty) {
-            recordFailedAttempt(username);
-            showError('Benutzername oder Passwort ist falsch.');
-            setBtn('loginBtn', 'Anmelden', false);
-            return;
-        }
-
-        const userDoc = snap.docs[0];
-        const userData = userDoc.data();
         const hash = await hashPassword(username, password);
-
-        if (userData.passwordHash !== hash) {
+        const account = await findAccount(username, hash);
+        if (account.status !== 'ok') {
             recordFailedAttempt(username);
             showError('Benutzername oder Passwort ist falsch.');
             setBtn('loginBtn', 'Anmelden', false);
@@ -142,10 +181,11 @@ async function doLogin() {
         clearRateLimit(username);
         const SESSION_DAYS = 30;
         localStorage.setItem('auth_session', JSON.stringify({
-            uid: userDoc.id,
-            username: userData.username,
-            displayName: userData.displayName || userData.username,
-            familyId: userData.familyId,
+            uid: account.userId,
+            username: account.username,
+            displayName: account.displayName,
+            familyId: account.familyId,
+            passwordHash: hash,
             expiresAt: Date.now() + SESSION_DAYS * 24 * 60 * 60 * 1000
         }));
 
@@ -177,8 +217,10 @@ async function doRegister() {
 
     try {
         // Benutzername auf Verfügbarkeit prüfen
-        const snap = await getDocs(query(collection(db, 'users'), where('username', '==', username.toLowerCase())));
-        if (!snap.empty) {
+        const taken = (await getDoc(doc(db, 'usernames', username.toLowerCase()))).exists()
+            || await getDocs(query(collection(db, 'users'), where('username', '==', username.toLowerCase())))
+                .then(s => !s.empty).catch(() => false);
+        if (taken) {
             showError('Dieser Benutzername ist bereits vergeben.');
             setBtn('registerBtn', 'Konto erstellen', false);
             return;
@@ -187,13 +229,18 @@ async function doRegister() {
         const hash = await hashPassword(username, password);
         const uid = crypto.randomUUID();
 
-        await setDoc(doc(db, 'users', uid), {
+        try { await signInGuest(); } catch (e) { /* Gast-Anmeldung noch nicht eingeschaltet */ }
+        const batch = writeBatch(db);
+        batch.set(doc(db, 'users', uid), {
             username: username.toLowerCase(),
             displayName: username,
             passwordHash: hash,
             familyId: uid,
             createdAt: new Date().toISOString()
         });
+        batch.set(doc(db, 'usernames', username.toLowerCase()), { userId: uid, familyId: uid });
+        await batch.commit();
+        joinFamily(uid, uid, username.toLowerCase(), hash).catch(() => {});
 
         const SESSION_DAYS = 30;
         localStorage.setItem('auth_session', JSON.stringify({
@@ -201,6 +248,7 @@ async function doRegister() {
             username: username.toLowerCase(),
             displayName: username,
             familyId: uid,
+            passwordHash: hash,
             expiresAt: Date.now() + SESSION_DAYS * 24 * 60 * 60 * 1000
         }));
 

@@ -1,22 +1,41 @@
-import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { initializeApp } from "https://www.gstatic.com/firebasejs/13.1.0/firebase-app.js";
 import {
-    getFirestore,
+    initializeFirestore,
+    persistentLocalCache,
+    persistentMultipleTabManager,
     collection,
     doc,
     getDoc,
     getDocs,
     setDoc,
-    addDoc,
     updateDoc,
     deleteDoc,
     onSnapshot,
     query,
-    orderBy,
     where,
     serverTimestamp,
-    Timestamp,
-    enableNetwork
-} from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+    enableNetwork,
+    writeBatch,
+    increment
+} from "https://www.gstatic.com/firebasejs/13.1.0/firebase-firestore.js";
+import { initVoice } from "./voice.js?v=2.0.0";
+
+export const APP_VERSION = '2.0.0';
+
+// Alte, zwischengespeicherte HTML-Seite (vor Version 2) erkennen: Service Worker
+// und Caches einmalig leeren und frisch laden, damit HTML und Skript zusammenpassen.
+if (!document.querySelector('meta[name="app-version"]') && !sessionStorage.getItem('versionReload')) {
+    sessionStorage.setItem('versionReload', '1');
+    document.body.style.visibility = 'hidden';
+    try {
+        const regs = await navigator.serviceWorker?.getRegistrations?.() || [];
+        await Promise.all(regs.map(r => r.unregister()));
+        const keys = await caches?.keys?.() || [];
+        await Promise.all(keys.map(k => caches.delete(k)));
+    } catch (e) {}
+    location.reload();
+    await new Promise(() => {});
+}
 
 const firebaseConfig = {
     apiKey: "AIzaSyDN17KahTrjPxIM2BfBSSJxou5y6U6PZHY",
@@ -28,102 +47,160 @@ const firebaseConfig = {
 };
 
 const app = initializeApp(firebaseConfig);
-const db = getFirestore(app);
+
+// Offline-Cache: Listen und Produkte sind auch ohne Netz sofort da
+let db;
+try {
+    db = initializeFirestore(app, {
+        localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
+    });
+} catch (e) {
+    db = initializeFirestore(app, {});
+}
+try { navigator.storage?.persist?.(); } catch (e) {}
 
 let currentFamilyId = null;
 let currentUser = null;
 let currentUsername = '';
 
-// ===== GLOBALE KI-KONSTANTEN =====
-const GROQ_PROXY = 'https://plain-wind-217b.tillrohde.workers.dev';
+// Einmalig: Speicher des entfernten KI-Chats aufräumen
+try {
+    Object.keys(localStorage)
+        .filter(k => k === 'ki_chat_v1' || k === 'ki_sessions_v1' || k.startsWith('ki_sess_'))
+        .forEach(k => localStorage.removeItem(k));
+} catch (e) {}
 
-// ===== KI-KATEGORISIERUNGS-QUEUE =====
-let _catQueue  = [];
-let _catTimer  = null;
+// ===== DEBUG-PROTOKOLL (für das versteckte Debug-Panel) =====
+const Debug = {
+    errors: (() => { try { return JSON.parse(localStorage.getItem('debug_errors') || '[]'); } catch (e) { return []; } })(),
+    listeners: {},
+    log(label, err) {
+        const entry = { at: new Date().toISOString(), label, msg: String(err?.code || err?.message || err) };
+        this.errors.unshift(entry);
+        this.errors = this.errors.slice(0, 25);
+        try { localStorage.setItem('debug_errors', JSON.stringify(this.errors)); } catch (e) {}
+        console.warn('[Einkaufsliste]', label, err);
+    }
+};
+window.addEventListener('error', e => Debug.log('Fehler', e.message));
+window.addEventListener('unhandledrejection', e => Debug.log('Promise', e.reason));
 
-function queueForAICategory(listId, name, docId) {
-    _catQueue.push({ listId, name, docId });
-    clearTimeout(_catTimer);
-    _catTimer = setTimeout(runAICategorization, 700);
+// Schreibvorgänge nie in der Oberfläche abwarten: offline bestätigt Firestore erst
+// beim nächsten Kontakt mit dem Server. Fehler landen im Debug-Protokoll.
+function commitQuietly(batch, label) {
+    batch.commit().catch(e => Debug.log(label, e));
 }
 
-async function runAICategorization() {
-    if (!_catQueue.length) return;
-    const batch = _catQueue.splice(0);
-    const categories = AppState.getCategories().filter(c => c.id !== 'sonstiges');
-    if (!categories.length) return;
+// ===== SELBSTHEILENDE LISTENER =====
+// Ein onSnapshot-Listener meldet sich nach einem Fehler nie wieder. Deshalb wird er
+// mit wachsender Wartezeit neu gestartet und beim Zurückkehren in die App geprüft.
+const liveListeners = new Set();
+const RETRY_DELAYS = [1000, 2000, 5000, 10000, 30000];
 
-    // Kategorien mit Beispielen für die KI
-    const catExamples = {
-        'Obst':              'Äpfel, Bananen, Orangen, Erdbeeren, Trauben',
-        'Gemüse':            'Tomaten, Karotten, Zwiebeln, Paprika, Gurken, Salat',
-        'Milchprodukte':     'Milch, Käse, Joghurt, Butter, Sahne, Quark, Eier',
-        'Kosmetik & Pflege': 'Shampoo, Seife, Duschgel, Zahnpasta, Deo, Creme, Parfum, Wattestäbchen',
-        'Haushaltsartikel':  'Waschmittel, Spülmittel, Putzmittel, Müllbeutel, Toilettenpapier, Schwämme',
-        'Süßigkeiten/Snacks':'Schokolade, Chips, Kekse, Gummibärchen, Bonbons',
-        'Fleisch & Wurst':   'Hähnchen, Rind, Schweinefleisch, Salami, Schinken, Hackfleisch',
-        'Backwaren':         'Brot, Brötchen, Toastbrot, Mehl, Hefe',
-        'Getränke':          'Wasser, Saft, Cola, Bier, Wein, Kaffee, Tee',
-        'Tiefkühlprodukte':  'Tiefkühlpizza, Eis, gefrorenes Gemüse',
-        'Konserven':         'Tomaten aus der Dose, Bohnen, Thunfisch, Fertigsuppe',
-    };
-    const catDescriptions = categories.map(c => {
-        const ex = catExamples[c.name];
-        return ex ? `"${c.name}" (z.B. ${ex})` : `"${c.name}"`;
-    }).join('\n');
+function liveListen(label, ref, onData) {
+    let unsub = null;
+    let attempt = 0;
+    let timer = null;
+    let stopped = false;
 
-    const lines = batch.map(b => `"${b.name}"`).join(', ');
-
-    try {
-        const res = await fetch(GROQ_PROXY, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                model: 'llama-3.1-8b-instant',
-                messages: [
-                    { role: 'system', content:
-`Du bist ein Kategorisierungs-Experte für Supermarkt-Produkte. Weise jedem Produkt die logisch passendste Kategorie zu. Antworte AUSSCHLIESSLICH mit gültigem JSON, kein Text davor oder danach.` },
-                    { role: 'user', content:
-`Verfügbare Kategorien:
-${catDescriptions}
-
-Produkte zum Kategorisieren: ${lines}
-
-WICHTIG:
-- Seife, Duschgel, Shampoo → "Kosmetik & Pflege"
-- Waschmittel, Spülmittel, Putzmittel → "Haushaltsartikel"
-- Milch, Käse, Joghurt, Eier, Butter → "Milchprodukte"
-- Fleisch, Wurst, Fisch → "Fleisch & Wurst"
-- Wenn keine passende Kategorie: "Sonstiges"
-
-Antworte NUR mit JSON:
-{"Produktname": "exakter Kategoriename"}`
-                    }
-                ],
-                max_tokens: 400,
-                temperature: 0
-            })
+    function start() {
+        if (stopped) return;
+        clearTimeout(timer);
+        try { unsub?.(); } catch (e) {}
+        unsub = onSnapshot(ref, { includeMetadataChanges: true }, (snap) => {
+            attempt = 0;
+            Debug.listeners[label] = { ok: true, fromCache: snap.metadata.fromCache, at: Date.now() };
+            onData(snap);
+        }, (err) => {
+            Debug.log(label, err);
+            Debug.listeners[label] = { ok: false, error: err.code || err.message, at: Date.now() };
+            unsub = null;
+            timer = setTimeout(start, RETRY_DELAYS[Math.min(attempt++, RETRY_DELAYS.length - 1)]);
         });
-        if (!res.ok) return;
-        const data = await res.json();
-        const text = (data.choices[0]?.message?.content || '').trim();
-        const m = text.match(/\{[\s\S]*\}/);
-        if (!m) return;
-        const result = JSON.parse(m[0]);
+    }
 
-        for (const item of batch) {
-            const catName = result[item.name];
-            if (!catName || catName.toLowerCase() === 'sonstiges') continue;
-            // Exakter Match zuerst, dann Teilmatch nur wenn eindeutig
-            const cat = categories.find(c => c.name.toLowerCase() === catName.toLowerCase())
-                || categories.find(c => c.name.toLowerCase().replace(/[&\/\s]+/g,'').includes(catName.toLowerCase().replace(/[&\/\s]+/g,'')));
-            if (!cat) continue;
-            try {
-                await updateDoc(doc(db, 'lists', item.listId, 'products', item.docId), { category: cat.id });
-            } catch(e) {}
-        }
-    } catch(e) {}
+    const handle = {
+        restart() { attempt = 0; start(); },
+        stop() { stopped = true; clearTimeout(timer); try { unsub?.(); } catch (e) {} liveListeners.delete(handle); },
+        get alive() { return !!unsub; }
+    };
+    liveListeners.add(handle);
+    start();
+    return handle;
 }
+
+function wakeUp() {
+    enableNetwork(db).catch(() => {});
+    liveListeners.forEach(h => { if (!h.alive) h.restart(); });
+}
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') wakeUp();
+});
+window.addEventListener('online', wakeUp);
+
+// Dokument lesen; ausstehende Server-Zeitstempel (z. B. deletedAt direkt nach dem
+// Abhaken) werden geschätzt statt null – sonst tauchen Produkte kurz wieder auf.
+function docData(d) {
+    return { id: d.id, ...d.data({ serverTimestamps: 'estimate' }) };
+}
+
+function tsMillis(v) {
+    if (!v) return 0;
+    if (typeof v.toMillis === 'function') return v.toMillis();
+    if (typeof v.seconds === 'number') return v.seconds * 1000;
+    return new Date(v).getTime() || 0;
+}
+
+// ===== LETZTER GUTER STAND (localStorage) =====
+// Wird beim Start sofort angezeigt, bevor Firestore antwortet.
+const Mirror = {
+    get(key) {
+        try { return JSON.parse(localStorage.getItem('mirror_' + key) || 'null'); } catch (e) { return null; }
+    },
+    set(key, value) {
+        try { localStorage.setItem('mirror_' + key, JSON.stringify(value)); } catch (e) {}
+    }
+};
+
+// Bilder (Base64) nie in den Spiegel schreiben – localStorage ist klein
+function stripForMirror(p) {
+    const { imageUrl, ...rest } = p;
+    const keepUrl = imageUrl && !String(imageUrl).startsWith('data:');
+    return { ...rest, imageUrl: keepUrl ? imageUrl : null, hasImage: !!(p.hasImage || imageUrl), addedAt: tsMillis(p.addedAt), deletedAt: tsMillis(p.deletedAt) || null };
+}
+
+// ===== GERÄTESICHERUNG (IndexedDB, letzte 7 Tagesstände) =====
+const DeviceBackup = {
+    _db: null,
+    open() {
+        if (this._db) return this._db;
+        this._db = new Promise((resolve, reject) => {
+            const req = indexedDB.open('einkaufsliste-sicherung', 1);
+            req.onupgradeneeded = () => req.result.createObjectStore('tage');
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+        });
+        return this._db;
+    },
+    async saveList(list, products) {
+        try {
+            const idb = await this.open();
+            const day = new Date().toISOString().slice(0, 10);
+            const store = idb.transaction('tage', 'readwrite').objectStore('tage');
+            const existing = await new Promise(r => { const g = store.get(day); g.onsuccess = () => r(g.result); g.onerror = () => r(null); });
+            const entry = existing || { day, lists: {} };
+            entry.lists[list.id] = { name: list.name, savedAt: Date.now(), products: products.map(stripForMirror) };
+            store.put(entry, day);
+            const keys = await new Promise(r => { const k = store.getAllKeys(); k.onsuccess = () => r(k.result); k.onerror = () => r([]); });
+            keys.sort().slice(0, Math.max(0, keys.length - 7)).forEach(k => store.delete(k));
+        } catch (e) { Debug.log('Gerätesicherung', e); }
+    },
+    async all() {
+        const idb = await this.open();
+        const store = idb.transaction('tage', 'readonly').objectStore('tage');
+        return new Promise(r => { const g = store.getAll(); g.onsuccess = () => r(g.result); g.onerror = () => r([]); });
+    }
+};
 
 // ===== STANDARD KATEGORIEN =====
 const DEFAULT_CATEGORIES = [
@@ -525,11 +602,13 @@ function detectCategory(productName) {
 }
 
 // ===== APP STATE =====
+const PRODUCT_TRASH_DAYS = 7;
+const LIST_TRASH_DAYS = 30;
+
 const AppState = {
     lists: [],
     activeListId: null,
     activeList: null,
-    unsubscribeProducts: null,
     customCategories: [],
     hiddenDefaultCategories: [],
 
@@ -538,13 +617,9 @@ const AppState = {
         if (activeId) this.activeListId = activeId;
     },
 
-    saveActiveListId() {
-        if (this.activeListId) localStorage.setItem('activeListId', this.activeListId);
-    },
-
     setActiveList(id) {
         this.activeListId = id;
-        this.saveActiveListId();
+        if (id) localStorage.setItem('activeListId', id);
     },
 
     // Gibt alle sichtbaren Kategorien zurück
@@ -560,169 +635,131 @@ const AppState = {
         return all.find(c => c.id === id) || { id: 'sonstiges', name: 'Sonstiges', emoji: '📦' };
     },
 
-    async loadCategorySettings(listId) {
-        // Eigene Kategorien laden
-        try {
-            const snap = await getDocs(collection(db, "lists", listId, "categories"));
-            this.customCategories = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-        } catch (e) {
-            this.customCategories = [];
-        }
-
-        // Ausgeblendete Standard-Kategorien laden
-        try {
-            const snap = await getDocs(collection(db, "lists", listId, "hiddenCategories"));
-            this.hiddenDefaultCategories = snap.docs.map(d => d.id);
-        } catch (e) {
-            this.hiddenDefaultCategories = [];
-        }
-    },
-
     async hideDefaultCategory(listId, catId) {
-        await setDoc(doc(db, "lists", listId, "hiddenCategories", catId), { hidden: true });
-        if (!this.hiddenDefaultCategories.includes(catId)) {
-            this.hiddenDefaultCategories.push(catId);
-        }
+        if (!this.hiddenDefaultCategories.includes(catId)) this.hiddenDefaultCategories.push(catId);
+        setDoc(doc(db, "lists", listId, "hiddenCategories", catId), { hidden: true })
+            .catch(e => Debug.log('Kategorie ausblenden', e));
     },
 
     async showDefaultCategory(listId, catId) {
-        await deleteDoc(doc(db, "lists", listId, "hiddenCategories", catId));
         this.hiddenDefaultCategories = this.hiddenDefaultCategories.filter(id => id !== catId);
+        deleteDoc(doc(db, "lists", listId, "hiddenCategories", catId))
+            .catch(e => Debug.log('Kategorie einblenden', e));
     },
 
     async addCustomCategory(listId, name, emoji) {
         const id = 'custom_' + Date.now();
         const cat = { id, name: name.trim(), emoji: emoji || '🏷️' };
-        await setDoc(doc(db, "lists", listId, "categories", id), cat);
         this.customCategories.push(cat);
+        setDoc(doc(db, "lists", listId, "categories", id), cat)
+            .catch(e => Debug.log('Kategorie anlegen', e));
         return cat;
     },
 
     async deleteCustomCategory(listId, catId) {
-        await deleteDoc(doc(db, "lists", listId, "categories", catId));
         this.customCategories = this.customCategories.filter(c => c.id !== catId);
+        deleteDoc(doc(db, "lists", listId, "categories", catId))
+            .catch(e => Debug.log('Kategorie löschen', e));
     },
 
-    async createList(name) {
-        const newDocRef = doc(collection(db, "lists"));
+    createList(name) {
+        const ref = doc(collection(db, "lists"));
         const list = {
-            id: newDocRef.id,
             name: name.trim() || "Einkaufsliste",
             familyId: currentFamilyId,
-            createdAt: serverTimestamp()
+            createdAt: serverTimestamp(),
+            productCount: 0,
+            deletedAt: null
         };
-        await setDoc(newDocRef, list);
-        this.setActiveList(newDocRef.id);
-        return { id: newDocRef.id, ...list };
+        const batch = writeBatch(db);
+        batch.set(ref, list);
+        commitQuietly(batch, 'Liste anlegen');
+        this.setActiveList(ref.id);
+        return ref.id;
     },
 
-    async renameList(id, newName) {
-        await updateDoc(doc(db, "lists", id), {
-            name: newName.trim() || "Einkaufsliste"
-        });
+    renameList(id, newName) {
+        updateDoc(doc(db, "lists", id), { name: newName.trim() || "Einkaufsliste" })
+            .catch(e => Debug.log('Liste umbenennen', e));
     },
 
-    async deleteList(id) {
-        try {
-            const productsSnapshot = await getDocs(collection(db, "lists", id, "products"));
-            for (const p of productsSnapshot.docs) {
-                await deleteDoc(doc(db, "lists", id, "products", p.id));
-            }
-        } catch (e) {}
-        try {
-            const categoriesSnapshot = await getDocs(collection(db, "lists", id, "categories"));
-            for (const c of categoriesSnapshot.docs) {
-                await deleteDoc(doc(db, "lists", id, "categories", c.id));
-            }
-        } catch (e) {}
-        try {
-            const hiddenSnapshot = await getDocs(collection(db, "lists", id, "hiddenCategories"));
-            for (const h of hiddenSnapshot.docs) {
-                await deleteDoc(doc(db, "lists", id, "hiddenCategories", h.id));
-            }
-        } catch (e) {}
-        try {
-            const deletedSnap = await getDocs(collection(db, "lists", id, "deletedProducts"));
-            for (const d of deletedSnap.docs) {
-                await deleteDoc(doc(db, "lists", id, "deletedProducts", d.id));
-            }
-        } catch (e) {}
-        await deleteDoc(doc(db, "lists", id));
-        this.lists = this.lists.filter(l => l.id !== id);
+    // Papierkorb statt Löschen: die Liste bekommt nur ein Datum, alle Produkte bleiben
+    deleteList(id) {
+        updateDoc(doc(db, "lists", id), { deletedAt: serverTimestamp(), deletedBy: currentUsername || null })
+            .catch(e => Debug.log('Liste in Papierkorb', e));
         if (this.activeListId === id) {
             this.activeListId = null;
             localStorage.removeItem("activeListId");
         }
     },
 
-    async addProduct(listId, name, category, imageUrl = null) {
-        if (!name.trim()) return false;
+    restoreList(id) {
+        updateDoc(doc(db, "lists", id), { deletedAt: null })
+            .catch(e => Debug.log('Liste wiederherstellen', e));
+    },
+
+    // Fügt ein Produkt hinzu (sofort, auch offline). Gibt die neue ID zurück.
+    addProduct(listId, name, category, imageUrl = null, extra = {}) {
+        if (!name || !name.trim()) return null;
         const autoCategory = category === 'sonstiges' ? detectCategory(name) : category;
-        const docRef = await addDoc(collection(db, "lists", listId, "products"), {
+        const ref = doc(collection(db, "lists", listId, "products"));
+        const isDataImage = imageUrl && String(imageUrl).startsWith('data:');
+        const batch = writeBatch(db);
+        batch.set(ref, {
             name: name.trim(),
             category: autoCategory,
             checked: false,
-            imageUrl: imageUrl || null,
-            addedAt: serverTimestamp()
+            imageUrl: isDataImage ? null : (imageUrl || null),
+            hasImage: !!imageUrl,
+            qty: extra.qty || null,
+            source: extra.source || 'hand',
+            addedBy: currentUsername || null,
+            addedAt: serverTimestamp(),
+            deletedAt: null
         });
-        // KI-Kategorisierung im Hintergrund wenn noch 'sonstiges'
-        if (autoCategory === 'sonstiges') {
-            queueForAICategory(listId, name.trim(), docRef.id);
+        // Fotos liegen in einer eigenen Sammlung und werden nur beim Antippen geladen
+        if (isDataImage) {
+            batch.set(doc(db, "lists", listId, "productImages", ref.id), { data: imageUrl, createdAt: serverTimestamp() });
         }
-        return true;
+        batch.update(doc(db, "lists", listId), { productCount: increment(1) });
+        commitQuietly(batch, 'Produkt hinzufügen');
+        return ref.id;
     },
 
-    async removeProduct(listId, productId) {
-        const productRef = doc(db, "lists", listId, "products", productId);
-        const snap = await getDoc(productRef);
-        if (snap.exists()) {
-            await setDoc(
-                doc(db, "lists", listId, "deletedProducts", productId),
-                { ...snap.data(), deletedAt: serverTimestamp() }
-            );
-        }
-        await deleteDoc(productRef);
+    updateProduct(listId, productId, fields) {
+        updateDoc(doc(db, "lists", listId, "products", productId), fields)
+            .catch(e => Debug.log('Produkt ändern', e));
     },
 
-    async getRecentlyDeletedProducts(listId) {
-        const cutoff = Timestamp.fromMillis(Date.now() - 10 * 60 * 1000);
-        const q = query(
-            collection(db, "lists", listId, "deletedProducts"),
-            where("deletedAt", ">=", cutoff),
-            orderBy("deletedAt", "desc")
-        );
-        const snap = await getDocs(q);
-        return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    // Abhaken / Entfernen = in den Papierkorb (7 Tage), nie endgültig löschen
+    removeProducts(listId, ids, reason = 'abgehakt') {
+        if (!ids.length) return;
+        const batch = writeBatch(db);
+        ids.forEach(id => batch.update(doc(db, "lists", listId, "products", id), {
+            deletedAt: serverTimestamp(),
+            deletedReason: reason,
+            deletedBy: currentUsername || null
+        }));
+        batch.update(doc(db, "lists", listId), { productCount: increment(-ids.length) });
+        commitQuietly(batch, 'Produkte entfernen');
     },
 
-    async cleanExpiredDeletedProducts(listId) {
-        const cutoff = Timestamp.fromMillis(Date.now() - 10 * 60 * 1000);
-        const q = query(
-            collection(db, "lists", listId, "deletedProducts"),
-            where("deletedAt", "<", cutoff)
-        );
-        const snap = await getDocs(q);
-        for (const d of snap.docs) {
-            await deleteDoc(doc(db, "lists", listId, "deletedProducts", d.id));
-        }
+    restoreProducts(listId, ids) {
+        if (!ids.length) return;
+        const batch = writeBatch(db);
+        ids.forEach(id => batch.update(doc(db, "lists", listId, "products", id), { deletedAt: null }));
+        batch.update(doc(db, "lists", listId), { productCount: increment(ids.length) });
+        commitQuietly(batch, 'Produkte wiederherstellen');
     },
 
-    async restoreProduct(listId, productId) {
-        const deletedRef = doc(db, "lists", listId, "deletedProducts", productId);
-        const snap = await getDoc(deletedRef);
-        if (!snap.exists()) return;
-        const { deletedAt, ...productData } = snap.data();
-        await setDoc(doc(db, "lists", listId, "products", productId), {
-            ...productData,
-            addedAt: serverTimestamp()
-        });
-        await deleteDoc(deletedRef);
-    },
-
-    async clearProducts(listId) {
-        const productsSnapshot = await getDocs(collection(db, "lists", listId, "products"));
-        for (const p of productsSnapshot.docs) {
-            await deleteDoc(doc(db, "lists", listId, "products", p.id));
+    async loadImage(listId, product) {
+        if (product.imageUrl) return product.imageUrl;
+        try {
+            const snap = await getDoc(doc(db, "lists", listId, "productImages", product.id));
+            return snap.exists() ? snap.data().data : null;
+        } catch (e) {
+            Debug.log('Foto laden', e);
+            return null;
         }
     }
 };
@@ -732,7 +769,7 @@ function showModal(id) {
     const modal = document.getElementById(id);
     if (!modal) return;
     modal.classList.add('active');
-    const input = modal.querySelector('input:not([readonly])');
+    const input = modal.querySelector('input:not([readonly]):not([type="file"])');
     if (input) setTimeout(() => input.focus(), 100);
 }
 
@@ -747,12 +784,22 @@ function hideAllModals() {
 
 function formatDate(dateValue) {
     if (!dateValue) return 'Gerade eben';
-    const date = dateValue.seconds ? new Date(dateValue.seconds * 1000) : new Date(dateValue);
+    const date = new Date(tsMillis(dateValue));
     const days = Math.floor((new Date() - date) / 86400000);
     if (days === 0) return 'Heute';
     if (days === 1) return 'Gestern';
     if (days < 7) return `Vor ${days} Tagen`;
     return date.toLocaleDateString('de-DE', { day: 'numeric', month: 'short' });
+}
+
+function formatAgo(ms) {
+    const mins = Math.max(0, Math.round((Date.now() - ms) / 60000));
+    if (mins < 1) return 'gerade eben';
+    if (mins < 60) return `vor ${mins} Min.`;
+    const hours = Math.round(mins / 60);
+    if (hours < 24) return `vor ${hours} Std.`;
+    const days = Math.round(hours / 24);
+    return days === 1 ? 'gestern' : `vor ${days} Tagen`;
 }
 
 function escapeHtml(text) {
@@ -776,6 +823,370 @@ function resizeImage(base64, maxWidth = 800) {
     });
 }
 
+function showToast(message, duration = 3000) {
+    document.getElementById('app-toast')?.remove();
+    const toast = document.createElement('div');
+    toast.id = 'app-toast';
+    toast.className = 'app-toast';
+    toast.setAttribute('role', 'status');
+    toast.textContent = message;
+    document.body.appendChild(toast);
+    setTimeout(() => toast.remove(), duration);
+}
+
+// ===== RÜCKGÄNGIG-LEISTE (6 Sekunden) =====
+let undoTimer = null;
+function showUndo(message, onUndo, duration = 6000) {
+    document.getElementById('undo-bar')?.remove();
+    clearTimeout(undoTimer);
+    const bar = document.createElement('div');
+    bar.id = 'undo-bar';
+    bar.className = 'undo-bar';
+    bar.setAttribute('role', 'status');
+    bar.innerHTML = `<span class="undo-text"></span><button class="undo-btn" type="button">Rückgängig</button>`;
+    bar.querySelector('.undo-text').textContent = message;
+    bar.querySelector('.undo-btn').addEventListener('click', () => {
+        bar.remove();
+        clearTimeout(undoTimer);
+        onUndo();
+    });
+    document.body.appendChild(bar);
+    requestAnimationFrame(() => bar.classList.add('visible'));
+    undoTimer = setTimeout(() => {
+        bar.classList.remove('visible');
+        setTimeout(() => bar.remove(), 300);
+    }, duration);
+}
+
+// ===== BESTÄTIGUNG (ersetzt confirm()) =====
+function askConfirm({ title, message, confirmText = 'Löschen', danger = true }) {
+    return new Promise((resolve) => {
+        let overlay = document.getElementById('appConfirm');
+        if (!overlay) {
+            overlay = document.createElement('div');
+            overlay.className = 'modal-overlay';
+            overlay.id = 'appConfirm';
+            overlay.innerHTML = `
+                <div class="modal" role="alertdialog" aria-modal="true">
+                    <div class="modal-header"><h2 class="ac-title"></h2></div>
+                    <div class="modal-body"><p class="ac-message confirm-text"></p></div>
+                    <div class="modal-footer">
+                        <button class="btn btn-cancel ac-cancel">Abbrechen</button>
+                        <button class="btn ac-ok"></button>
+                    </div>
+                </div>`;
+            document.body.appendChild(overlay);
+        }
+        overlay.querySelector('.ac-title').textContent = title;
+        overlay.querySelector('.ac-message').textContent = message;
+        const ok = overlay.querySelector('.ac-ok');
+        ok.textContent = confirmText;
+        ok.className = 'btn ac-ok ' + (danger ? 'btn-danger' : 'btn-confirm');
+        const done = (value) => {
+            overlay.classList.remove('active');
+            ok.onclick = null;
+            overlay.querySelector('.ac-cancel').onclick = null;
+            overlay.onclick = null;
+            resolve(value);
+        };
+        ok.onclick = () => done(true);
+        overlay.querySelector('.ac-cancel').onclick = () => done(false);
+        overlay.onclick = (e) => { if (e.target === overlay) done(false); };
+        overlay.classList.add('active');
+    });
+}
+
+// ===== SICHERUNG HERUNTERLADEN / EINSPIELEN =====
+function downloadJson(filename, data) {
+    const blob = new Blob([JSON.stringify(data, null, 1)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+function plainValue(v) {
+    if (v && typeof v.toMillis === 'function') return { __ms: v.toMillis() };
+    if (Array.isArray(v)) return v.map(plainValue);
+    if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, plainValue(x)]));
+    return v;
+}
+
+async function exportFamilyBackup() {
+    const listsSnap = await getDocs(query(collection(db, "lists"), where("familyId", "==", currentFamilyId)));
+    const lists = [];
+    for (const l of listsSnap.docs) {
+        const [products, categories, hidden] = await Promise.all([
+            getDocs(collection(db, "lists", l.id, "products")),
+            getDocs(collection(db, "lists", l.id, "categories")),
+            getDocs(collection(db, "lists", l.id, "hiddenCategories"))
+        ]);
+        lists.push({
+            id: l.id,
+            data: plainValue(l.data()),
+            products: products.docs.map(d => ({ id: d.id, data: plainValue(d.data()) })),
+            categories: categories.docs.map(d => ({ id: d.id, data: plainValue(d.data()) })),
+            hiddenCategories: hidden.docs.map(d => d.id)
+        });
+    }
+    return { app: 'einkaufsliste', version: 1, exportedAt: new Date().toISOString(), familyId: currentFamilyId, lists };
+}
+
+function fromPlain(v) {
+    if (v && typeof v === 'object' && '__ms' in v) return new Date(v.__ms);
+    if (Array.isArray(v)) return v.map(fromPlain);
+    if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, fromPlain(x)]));
+    return v;
+}
+
+// Spielt eine Sicherung additiv ein: fehlende Listen und Produkte werden angelegt,
+// gelöschte wiederhergestellt. Es wird nichts überschrieben oder entfernt.
+async function importFamilyBackup(backup) {
+    if (!backup || backup.app !== 'einkaufsliste' || !Array.isArray(backup.lists)) {
+        throw new Error('Das ist keine Sicherung dieser App.');
+    }
+    let batch = writeBatch(db);
+    let ops = 0;
+    let restoredLists = 0;
+    let restoredProducts = 0;
+    const flush = async () => { if (ops) { await batch.commit(); batch = writeBatch(db); ops = 0; } };
+    const add = async (fn) => { fn(batch); ops++; if (ops >= 400) await flush(); };
+
+    for (const l of backup.lists) {
+        const listRef = doc(db, "lists", l.id);
+        const existing = await getDoc(listRef);
+        const products = l.products || [];
+        if (!existing.exists()) {
+            await add(b => b.set(listRef, { ...fromPlain(l.data), familyId: currentFamilyId, deletedAt: null }));
+            restoredLists++;
+        } else if (existing.data().deletedAt) {
+            await add(b => b.update(listRef, { deletedAt: null }));
+            restoredLists++;
+        }
+        const current = await getDocs(collection(db, "lists", l.id, "products"));
+        const byId = new Map(current.docs.map(d => [d.id, d.data()]));
+        for (const p of products) {
+            const data = fromPlain(p.data);
+            if (data.deletedAt) continue;
+            const have = byId.get(p.id);
+            if (!have) {
+                await add(b => b.set(doc(db, "lists", l.id, "products", p.id), { ...data, deletedAt: null }));
+                restoredProducts++;
+            } else if (have.deletedAt) {
+                await add(b => b.update(doc(db, "lists", l.id, "products", p.id), { deletedAt: null }));
+                restoredProducts++;
+            }
+        }
+        for (const c of l.categories || []) {
+            await add(b => b.set(doc(db, "lists", l.id, "categories", c.id), fromPlain(c.data), { merge: true }));
+        }
+    }
+    await flush();
+    return { restoredLists, restoredProducts };
+}
+
+function pickJsonFile() {
+    return new Promise((resolve) => {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'application/json,.json';
+        input.onchange = async () => {
+            const file = input.files?.[0];
+            if (!file) return resolve(null);
+            try { resolve(JSON.parse(await file.text())); } catch (e) { resolve({ __error: true }); }
+        };
+        input.click();
+    });
+}
+
+async function runBackupDownload() {
+    showToast('Sicherung wird erstellt…');
+    try {
+        const data = await exportFamilyBackup();
+        const count = data.lists.reduce((n, l) => n + l.products.filter(p => !p.data.deletedAt).length, 0);
+        downloadJson(`einkaufsliste-sicherung-${new Date().toISOString().slice(0, 10)}.json`, data);
+        showToast(`Gesichert: ${data.lists.length} Listen, ${count} Produkte`);
+    } catch (e) {
+        Debug.log('Sicherung', e);
+        showToast('Sicherung ging nicht. Bitte mit Internet erneut versuchen.', 4000);
+    }
+}
+
+async function runBackupImport() {
+    const backup = await pickJsonFile();
+    if (!backup) return;
+    if (backup.__error || backup.app !== 'einkaufsliste') {
+        showToast('Diese Datei ist keine Sicherung der Einkaufsliste.', 4000);
+        return;
+    }
+    const n = backup.lists.reduce((s, l) => s + (l.products || []).filter(p => !p.data?.deletedAt).length, 0);
+    const ok = await askConfirm({
+        title: 'Sicherung einspielen?',
+        message: `Sicherung vom ${new Date(backup.exportedAt).toLocaleDateString('de-DE')} mit ${backup.lists.length} Listen und ${n} Produkten. Fehlende Listen und Produkte werden wiederhergestellt, nichts wird gelöscht.`,
+        confirmText: 'Einspielen',
+        danger: false
+    });
+    if (!ok) return;
+    try {
+        const r = await importFamilyBackup(backup);
+        showToast(`Fertig: ${r.restoredLists} Listen und ${r.restoredProducts} Produkte wiederhergestellt`, 4500);
+    } catch (e) {
+        Debug.log('Einspielen', e);
+        showToast('Einspielen fehlgeschlagen: ' + (e.message || e), 4500);
+    }
+}
+
+async function runDeviceBackupDownload() {
+    try {
+        const days = await DeviceBackup.all();
+        downloadJson(`einkaufsliste-geraetesicherung-${new Date().toISOString().slice(0, 10)}.json`, { app: 'einkaufsliste-geraet', days });
+    } catch (e) {
+        showToast('Keine Gerätesicherung vorhanden.');
+    }
+}
+
+// ===== DEBUG-PANEL (5× schnell auf den Titel tippen) =====
+function attachDebugTrigger(el) {
+    if (!el) return;
+    let taps = [];
+    el.addEventListener('click', () => {
+        const now = Date.now();
+        taps = taps.filter(t => now - t < 2500);
+        taps.push(now);
+        if (taps.length >= 5) { taps = []; openDebugPanel(); }
+    });
+}
+
+async function openDebugPanel() {
+    let persisted = 'unbekannt';
+    try { persisted = (await navigator.storage?.persisted?.()) ? 'ja' : 'nein'; } catch (e) {}
+    const listeners = Object.entries(Debug.listeners).map(([k, v]) =>
+        `${v.ok ? '🟢' : '🔴'} ${k}: ${v.ok ? (v.fromCache ? 'aus Cache' : 'live vom Server') : v.error} (${formatAgo(v.at)})`
+    ).join('\n') || '–';
+    const errors = Debug.errors.slice(0, 10).map(e => `${e.at.slice(5, 16).replace('T', ' ')} ${e.label}: ${e.msg}`).join('\n') || 'keine';
+    const text = [
+        `Version: ${APP_VERSION}`,
+        `Internet: ${navigator.onLine ? 'online' : 'OFFLINE'}`,
+        `Benutzer: ${currentUsername} (Familie ${String(currentFamilyId).slice(0, 8)}…)`,
+        `Speicher dauerhaft: ${persisted}`,
+        `Service Worker: ${navigator.serviceWorker?.controller ? 'aktiv' : 'keiner'}`,
+        '', 'Verbindungen:', listeners, '', 'Letzte Fehler:', errors
+    ].join('\n');
+
+    let overlay = document.getElementById('debugPanel');
+    if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.id = 'debugPanel';
+        overlay.innerHTML = `
+            <div class="modal">
+                <div class="modal-header"><h2>Diagnose</h2></div>
+                <div class="modal-body"><pre class="debug-text"></pre></div>
+                <div class="modal-footer debug-actions">
+                    <button class="btn btn-cancel" data-act="copy">Kopieren</button>
+                    <button class="btn btn-cancel" data-act="device">Gerätesicherung</button>
+                    <button class="btn btn-cancel" data-act="reload">Neu laden</button>
+                    <button class="btn btn-confirm" data-act="close">Schließen</button>
+                </div>
+            </div>`;
+        document.body.appendChild(overlay);
+        overlay.addEventListener('click', async (e) => {
+            const act = e.target.closest('[data-act]')?.dataset.act;
+            if (e.target === overlay || act === 'close') overlay.classList.remove('active');
+            if (act === 'copy') {
+                try { await navigator.clipboard.writeText(overlay.querySelector('.debug-text').textContent); showToast('Kopiert'); } catch (err) {}
+            }
+            if (act === 'device') runDeviceBackupDownload();
+            if (act === 'reload') { wakeUp(); location.reload(); }
+        });
+    }
+    overlay.querySelector('.debug-text').textContent = text;
+    overlay.classList.add('active');
+}
+
+// ===== FIREBASE-ANMELDUNG (Gast-Konto + Familien-Mitgliedschaft) =====
+// Vorbereitung für sichere Regeln: Jedes Gerät meldet sich still als Gast an und
+// trägt sich als Mitglied seiner Familie ein. Niemand muss sich neu anmelden.
+// Ist die Gast-Anmeldung in Firebase (noch) nicht eingeschaltet, passiert nichts.
+let authReady = null;
+function getAuthUser() {
+    if (!authReady) {
+        authReady = (async () => {
+            const { getAuth, signInAnonymously, onAuthStateChanged } = await import("https://www.gstatic.com/firebasejs/13.1.0/firebase-auth.js");
+            const auth = getAuth(app);
+            const existing = await new Promise((resolve) => {
+                const unsub = onAuthStateChanged(auth, (u) => { unsub(); resolve(u); });
+            });
+            return existing || (await signInAnonymously(auth)).user;
+        })().catch((e) => { authReady = null; throw e; });
+    }
+    return authReady;
+}
+
+async function getIdToken() {
+    try { return await (await getAuthUser()).getIdToken(); } catch (e) { return null; }
+}
+
+async function ensureMembership() {
+    if (Number(localStorage.getItem('auth_off_until') || 0) > Date.now()) return;
+    try {
+        const user = await getAuthUser();
+        const flag = `member_${user.uid}_${currentFamilyId}`;
+        if (localStorage.getItem(flag)) return;
+        const data = {
+            userId: currentUser.uid || null,
+            username: currentUser.username || null,
+            joinedAt: serverTimestamp(),
+            device: navigator.userAgent.slice(0, 120)
+        };
+        if (currentUser.passwordHash) data.proof = currentUser.passwordHash;
+        await setDoc(doc(db, "families", currentFamilyId, "members", user.uid), data, { merge: true });
+        localStorage.setItem(flag, '1');
+    } catch (e) {
+        // Gast-Anmeldung in Firebase noch nicht eingeschaltet → 12 Stunden nicht erneut versuchen
+        if (/configuration-not-found|operation-not-allowed|admin-restricted/.test(e?.code || '')) {
+            localStorage.setItem('auth_off_until', String(Date.now() + 12 * 3600 * 1000));
+        }
+        Debug.log('Anmeldung', e);
+    }
+}
+
+// ===== NEUE VERSION – NEU LADEN =====
+function registerServiceWorker() {
+    if (!('serviceWorker' in navigator)) return;
+    navigator.serviceWorker.register('sw.js').then((reg) => {
+        const offer = (worker) => {
+            if (!worker || !navigator.serviceWorker.controller) return;
+            if (document.getElementById('update-banner')) return;
+            const banner = document.createElement('div');
+            banner.id = 'update-banner';
+            banner.className = 'update-banner';
+            banner.innerHTML = `<span>Neue Version verfügbar</span><button type="button">Neu laden</button>`;
+            banner.querySelector('button').addEventListener('click', () => worker.postMessage('SKIP_WAITING'));
+            document.body.appendChild(banner);
+        };
+        if (reg.waiting) offer(reg.waiting);
+        reg.addEventListener('updatefound', () => {
+            const w = reg.installing;
+            w?.addEventListener('statechange', () => { if (w.state === 'installed') offer(w); });
+        });
+        // Beim Zurückkehren in die App nach Updates schauen
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') reg.update().catch(() => {});
+        });
+    }).catch(e => Debug.log('Service Worker', e));
+    let reloading = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+        if (reloading) return;
+        reloading = true;
+        location.reload();
+    });
+}
+
 const isHomePage = !!document.getElementById('newListBtn');
 const isListPage = !!document.getElementById('addProductBtn');
 
@@ -794,14 +1205,8 @@ currentUsername = _session.displayName || _session.username || '';
 currentUser = _session;
 
 AppState.initLocalState();
-
-// Firestore-Verbindung wiederherstellen wenn App aus dem Hintergrund kommt
-// (iOS/Android pausieren die WebSocket-Verbindung → Sync stagniert)
-document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') {
-        enableNetwork(db).catch(() => {});
-    }
-});
+registerServiceWorker();
+ensureMembership();
 
 // ===== STARTSEITE =====
 if (isHomePage) {
@@ -810,81 +1215,202 @@ if (isHomePage) {
         const subtitleEl = document.querySelector('.subtitle');
         if (subtitleEl) subtitleEl.textContent = `Hallo, ${currentUsername}!`;
     }
+    attachDebugTrigger(document.querySelector('.header h1') || document.querySelector('h1'));
 
-    // Logout
-    const logoutBtn = document.getElementById('logoutBtn');
-    if (logoutBtn) {
-        logoutBtn.addEventListener('click', async () => {
-            localStorage.removeItem('auth_session');
-            window.location.href = 'auth.html';
-        });
-    }
+    const logout = () => {
+        localStorage.removeItem('auth_session');
+        window.location.href = 'auth.html';
+    };
+    document.getElementById('logoutBtn')?.addEventListener('click', logout);
 
     const listsContainer = document.getElementById('listsContainer');
     const recentLists = document.getElementById('recentLists');
     const listNameInput = document.getElementById('listNameInput');
-    let pendingDeleteListId = null;
+    const homeStatus = document.getElementById('homeStatus');
+    let allLists = [];
+    let menuListId = null;
+    let serverConfirmed = false;
+
+    const openList = (id) => {
+        AppState.setActiveList(id);
+        window.location.href = `shopping-list.html?list=${encodeURIComponent(id)}`;
+    };
+
+    function countLabel(list) {
+        return typeof list.productCount === 'number' ? `${Math.max(0, list.productCount)} Produkte · ` : '';
+    }
 
     function renderRecentLists() {
-        if (AppState.lists.length === 0) {
-            recentLists.classList.remove('has-lists');
-            listsContainer.innerHTML = '';
+        const visible = AppState.lists;
+        if (visible.length === 0) {
+            listsContainer.innerHTML = serverConfirmed
+                ? ''
+                : `<div class="skeleton-card"></div><div class="skeleton-card"></div>`;
+            recentLists.classList.toggle('has-lists', !serverConfirmed);
             return;
         }
         recentLists.classList.add('has-lists');
-        listsContainer.innerHTML = AppState.lists.map(list => `
-            <div class="list-card" data-list-id="${list.id}" role="button" tabindex="0" aria-label="Liste ${escapeHtml(list.name)} öffnen">
-                <div class="list-card-info">
-                    <h3>${escapeHtml(list.name)}</h3>
-                    <span>${list.productCount || 0} Produkte · ${formatDate(list.createdAt)}</span>
-                </div>
-                <div style="display:flex;align-items:center;gap:6px;">
-                    <div class="list-card-arrow">
-                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                            <polyline points="9 18 15 12 9 6"></polyline>
-                        </svg>
-                    </div>
-                    <button class="list-card-delete-btn" data-list-id="${list.id}" aria-label="Liste löschen">
-                        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                            <polyline points="3 6 5 6 21 6"></polyline>
-                            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path>
-                        </svg>
+        // Diff-Rendering: vorhandene Karten wiederverwenden
+        const existing = new Map([...listsContainer.querySelectorAll('.list-card')].map(el => [el.dataset.listId, el]));
+        listsContainer.querySelectorAll('.skeleton-card').forEach(el => el.remove());
+        visible.forEach((list, index) => {
+            const sig = `${list.name}|${list.productCount}|${tsMillis(list.createdAt)}`;
+            let card = existing.get(list.id);
+            if (!card) {
+                card = document.createElement('div');
+                card.className = 'list-card';
+                card.dataset.listId = list.id;
+                card.innerHTML = `
+                    <button class="list-card-open" type="button">
+                        <span class="list-card-info"><h3></h3><span class="list-card-meta"></span></span>
+                        <span class="list-card-arrow" aria-hidden="true">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
+                        </span>
                     </button>
-                </div>
-            </div>
-        `).join('');
-
-        listsContainer.querySelectorAll('.list-card').forEach(card => {
-            card.addEventListener('click', () => {
-                AppState.setActiveList(card.dataset.listId);
-                window.location.href = `shopping-list.html?list=${encodeURIComponent(card.dataset.listId)}`;
-            });
-            card.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); card.click(); }
-            });
+                    <button class="list-card-more" type="button" aria-label="Mehr Optionen">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
+                    </button>`;
+            }
+            existing.delete(list.id);
+            if (card.dataset.sig !== sig) {
+                card.dataset.sig = sig;
+                card.querySelector('h3').textContent = list.name || 'Einkaufsliste';
+                card.querySelector('.list-card-meta').textContent = `${countLabel(list)}${formatDate(list.createdAt)}`;
+                card.querySelector('.list-card-open').setAttribute('aria-label', `Liste ${list.name} öffnen`);
+                card.querySelector('.list-card-more').setAttribute('aria-label', `Optionen für ${list.name}`);
+            }
+            if (listsContainer.children[index] !== card) listsContainer.insertBefore(card, listsContainer.children[index] || null);
         });
-
-        listsContainer.querySelectorAll('.list-card-delete-btn').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                pendingDeleteListId = btn.dataset.listId;
-                showModal('homeDeleteModal');
-            });
-        });
+        existing.forEach(el => el.remove());
     }
 
-    let snapshotCallVersion = 0;
-    onSnapshot(query(collection(db, "lists"), where("familyId", "==", currentFamilyId)), async (snapshot) => {
-        const thisVersion = ++snapshotCallVersion;
-        const raw = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
-        const withCounts = await Promise.all(raw.map(async list => {
-            const snap = await getDocs(collection(db, "lists", list.id, "products"));
-            return { ...list, productCount: snap.size };
-        }));
-        if (thisVersion !== snapshotCallVersion) return;
-        AppState.lists = withCounts.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
-        renderRecentLists();
+    listsContainer.addEventListener('click', (e) => {
+        const card = e.target.closest('.list-card');
+        if (!card) return;
+        if (e.target.closest('.list-card-more')) {
+            menuListId = card.dataset.listId;
+            const list = allLists.find(l => l.id === menuListId);
+            document.getElementById('listMenuTitle').textContent = list?.name || 'Liste';
+            showModal('listMenuModal');
+            return;
+        }
+        openList(card.dataset.listId);
     });
+
+    function applyLists(lists, confirmed) {
+        allLists = lists;
+        AppState.lists = lists
+            .filter(l => !l.deletedAt)
+            .sort((a, b) => tsMillis(b.createdAt) - tsMillis(a.createdAt));
+        if (confirmed) serverConfirmed = true;
+        renderRecentLists();
+    }
+
+    // Sofort-Anzeige aus dem letzten guten Stand
+    const mirrored = Mirror.get('lists_' + currentFamilyId);
+    if (mirrored?.length) applyLists(mirrored, false);
+    else renderRecentLists();
+
+    liveListen('Listen', query(collection(db, "lists"), where("familyId", "==", currentFamilyId)), (snap) => {
+        const lists = snap.docs.map(docData);
+        const fromCache = snap.metadata.fromCache;
+        // Leerer Cache-Stand ersetzt nie eine bereits angezeigte Übersicht
+        if (fromCache && lists.length === 0 && allLists.length > 0) return;
+        applyLists(lists, !fromCache);
+        if (homeStatus) homeStatus.classList.toggle('visible', fromCache);
+        if (!fromCache || lists.length) {
+            Mirror.set('lists_' + currentFamilyId, lists.map(l => ({
+                ...l, createdAt: tsMillis(l.createdAt), deletedAt: tsMillis(l.deletedAt) || null
+            })));
+        }
+    });
+
+    // ── Listen-Menü (⋯ auf der Karte) ──────────────────────────────
+    document.getElementById('listMenuOpen')?.addEventListener('click', () => {
+        hideModal('listMenuModal');
+        if (menuListId) openList(menuListId);
+    });
+    document.getElementById('listMenuRename')?.addEventListener('click', () => {
+        hideModal('listMenuModal');
+        const list = allLists.find(l => l.id === menuListId);
+        document.getElementById('homeRenameInput').value = list?.name || '';
+        showModal('homeRenameModal');
+    });
+    document.getElementById('homeRenameCancel')?.addEventListener('click', () => hideModal('homeRenameModal'));
+    document.getElementById('homeRenameConfirm')?.addEventListener('click', () => {
+        const name = document.getElementById('homeRenameInput').value.trim();
+        if (menuListId && name) AppState.renameList(menuListId, name);
+        hideModal('homeRenameModal');
+    });
+    document.getElementById('homeRenameInput')?.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') document.getElementById('homeRenameConfirm').click();
+    });
+    document.getElementById('listMenuDelete')?.addEventListener('click', async () => {
+        hideModal('listMenuModal');
+        const list = allLists.find(l => l.id === menuListId);
+        if (!list) return;
+        const count = typeof list.productCount === 'number' ? list.productCount : null;
+        const ok = await askConfirm({
+            title: 'Liste löschen?',
+            message: `„${list.name}“${count !== null ? ` mit ${count} Produkten` : ''} kommt in den Papierkorb und kann ${LIST_TRASH_DAYS} Tage lang wiederhergestellt werden.`,
+            confirmText: 'In den Papierkorb'
+        });
+        if (!ok) return;
+        AppState.deleteList(list.id);
+        showUndo(`„${list.name}“ gelöscht`, () => AppState.restoreList(list.id));
+    });
+    document.getElementById('listMenuCancel')?.addEventListener('click', () => hideModal('listMenuModal'));
+
+    // ── Mehr-Menü (Papierkorb, Sicherung) ──────────────────────────
+    document.getElementById('homeMoreBtn')?.addEventListener('click', () => showModal('homeMenuModal'));
+    document.getElementById('homeMenuCancel')?.addEventListener('click', () => hideModal('homeMenuModal'));
+    document.getElementById('homeMenuBackup')?.addEventListener('click', () => { hideModal('homeMenuModal'); runBackupDownload(); });
+    document.getElementById('homeMenuImport')?.addEventListener('click', () => { hideModal('homeMenuModal'); runBackupImport(); });
+    document.getElementById('homeMenuLogout')?.addEventListener('click', () => { hideModal('homeMenuModal'); logout(); });
+    document.getElementById('homeMenuTrash')?.addEventListener('click', () => {
+        hideModal('homeMenuModal');
+        renderListTrash();
+        showModal('listTrashModal');
+    });
+    document.getElementById('closeListTrash')?.addEventListener('click', () => hideModal('listTrashModal'));
+
+    function renderListTrash() {
+        const body = document.getElementById('listTrashBody');
+        const cutoff = Date.now() - LIST_TRASH_DAYS * 86400000;
+        const items = allLists
+            .filter(l => l.deletedAt && tsMillis(l.deletedAt) > cutoff)
+            .sort((a, b) => tsMillis(b.deletedAt) - tsMillis(a.deletedAt));
+        if (!items.length) {
+            body.innerHTML = `<div class="deleted-empty-state">Der Papierkorb ist leer</div>`;
+            return;
+        }
+        body.innerHTML = `<div class="deleted-product-list">${items.map(l => `
+            <div class="deleted-product-item">
+                <div class="deleted-product-item-info">
+                    <span class="deleted-product-item-name">${escapeHtml(l.name)}</span>
+                    <span class="deleted-product-item-meta">${typeof l.productCount === 'number' ? l.productCount + ' Produkte · ' : ''}gelöscht ${formatAgo(tsMillis(l.deletedAt))}</span>
+                </div>
+                <button class="restore-btn" data-list-id="${l.id}">Wiederherstellen</button>
+            </div>`).join('')}</div>`;
+    }
+    document.getElementById('listTrashBody')?.addEventListener('click', (e) => {
+        const btn = e.target.closest('.restore-btn');
+        if (!btn) return;
+        AppState.restoreList(btn.dataset.listId);
+        btn.closest('.deleted-product-item').remove();
+        showToast('Liste ist wieder da');
+        if (!document.querySelector('#listTrashBody .deleted-product-item')) renderListTrash();
+    });
+
+    // Liste wurde auf der Listenseite gelöscht → hier Rückgängig anbieten
+    const justDeleted = sessionStorage.getItem('undoListDelete');
+    if (justDeleted) {
+        sessionStorage.removeItem('undoListDelete');
+        try {
+            const { id, name } = JSON.parse(justDeleted);
+            showUndo(`„${name}“ gelöscht`, () => AppState.restoreList(id));
+        } catch (e) {}
+    }
 
     // ── Konto teilen ──────────────────────────────────────────────
     function buildShareMessage(password) {
@@ -895,22 +1421,22 @@ if (isHomePage) {
         return `Ich lade dich zu meiner Einkaufsliste ein! 🛒\n\nÖffne den Link und gib diese Daten ein:\n👤 Benutzername: ${uname}\n🔑 Passwort: ${pw}\n\n🔗 ${appUrl}`;
     }
 
-    document.getElementById('shareAccountBtn').addEventListener('click', () => {
+    document.getElementById('shareAccountBtn')?.addEventListener('click', () => {
         document.getElementById('sharePasswordInput').value = '';
         document.getElementById('sharePasswordError').style.display = 'none';
         document.getElementById('sharePreviewText').textContent = buildShareMessage('');
         showModal('shareAccountModal');
     });
 
-    document.getElementById('sharePasswordInput').addEventListener('input', () => {
+    document.getElementById('sharePasswordInput')?.addEventListener('input', () => {
         const pw = document.getElementById('sharePasswordInput').value;
         document.getElementById('sharePreviewText').textContent = buildShareMessage(pw);
         document.getElementById('sharePasswordError').style.display = 'none';
     });
 
-    document.getElementById('closeShareAccount').addEventListener('click', () => hideModal('shareAccountModal'));
+    document.getElementById('closeShareAccount')?.addEventListener('click', () => hideModal('shareAccountModal'));
 
-    document.getElementById('doShareAccount').addEventListener('click', async () => {
+    document.getElementById('doShareAccount')?.addEventListener('click', async () => {
         const pw = document.getElementById('sharePasswordInput').value;
         if (!pw) {
             document.getElementById('sharePasswordError').style.display = 'block';
@@ -949,801 +1475,44 @@ if (isHomePage) {
 
     document.getElementById('cancelNewList').addEventListener('click', () => hideModal('newListModal'));
 
-    document.getElementById('confirmNewList').addEventListener('click', async () => {
+    document.getElementById('confirmNewList').addEventListener('click', () => {
         const name = listNameInput.value.trim() || 'Einkaufsliste';
-        const newList = await AppState.createList(name);
+        const id = AppState.createList(name);
         hideModal('newListModal');
-        window.location.href = `shopping-list.html?list=${encodeURIComponent(newList.id)}`;
+        window.location.href = `shopping-list.html?list=${encodeURIComponent(id)}&new=1`;
     });
 
     listNameInput.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') document.getElementById('confirmNewList').click();
     });
 
-    document.getElementById('homeDeleteCancel').addEventListener('click', () => {
-        pendingDeleteListId = null;
-        hideModal('homeDeleteModal');
-    });
-
-    document.getElementById('homeDeleteConfirm').addEventListener('click', async () => {
-        if (pendingDeleteListId) {
-            await AppState.deleteList(pendingDeleteListId);
-            pendingDeleteListId = null;
-        }
-        hideModal('homeDeleteModal');
-    });
-
     document.querySelectorAll('.modal-overlay').forEach(overlay => {
         overlay.addEventListener('click', (e) => {
-            if (e.target === overlay) { pendingDeleteListId = null; hideAllModals(); }
+            if (e.target === overlay) hideAllModals();
         });
     });
-
-    // ===== KI-ASSISTENT =====
-    function buildSystemPrompt() {
-        const lists = AppState.lists || [];
-        const defaultList = lists[0]?.name || 'Einkauf';
-        const listsStr = lists.map(l => `"${l.name}"`).join(', ') || `"${defaultList}"`;
-        return `Du bist ein hilfreicher, freundlicher KI-Assistent in einer deutschen Familien-Einkaufslisten-App – wie ChatGPT. Antworte IMMER auf Deutsch. Antworte auf ALLES was der Nutzer fragt.
-
-LISTEN-VERWALTUNG: Du kannst Produkte zu Einkaufslisten hinzufügen. Wenn der Nutzer Produkte hinzufügen möchte, schreibe ZUERST diesen Block:
-<action>{"type":"add","ops":[{"list":"Listenname","items":["Produkt1","Produkt2"]}]}</action>
-Danach eine kurze Bestätigungsnachricht.
-
-Verfügbare Listen: ${listsStr}
-Standard-Liste (wenn keine Liste genannt): "${defaultList}"
-
-KRITISCH: Füge AUSSCHLIESSLICH Produkte hinzu die der Nutzer EXPLIZIT genannt hat. Erfinde NIE eigene Produkte dazu.
-FALSCH: Nutzer sagt "Briefmarken" → du fügst ["Briefmarken","Eier","Milch"] hinzu ← VERBOTEN
-RICHTIG: Nutzer sagt "Briefmarken" → du fügst ["Briefmarken"] hinzu
-
-Wenn du ein Rezept gibst, nutze dieses Format:
-## [Rezeptname]
-[1-2 Sätze]
-
-## Zutaten (für [N] Personen)
-- [Menge] [Zutat]
-
-## Zubereitung
-1. [Schritt]
-
-Regeln: Nur ganze Zahlen ("1 Zwiebel", "3 EL Öl"), realistische Familienrezepte.
-Bei anderen Fragen: freundlich und hilfreich, ohne Rezeptformat.`;
-    }
-
-    const CHAT_STORE  = 'ki_chat_v1';
-    let aiHistory     = [];
-    let chatLoaded    = false;
-
-    const aiFab      = document.getElementById('aiFab');
-    const aiDrawer   = document.getElementById('aiDrawer');
-    const aiOverlay  = document.getElementById('aiDrawerOverlay');
-    const aiMessages = document.getElementById('aiMessages');
-    const aiInput    = document.getElementById('aiInput');
-    const aiSendBtn  = document.getElementById('aiSendBtn');
-    const aiStatus   = document.getElementById('aiStatus');
-
-    // ===== CHAT VERLAUF =====
-    function saveChatHistory() {
-        const msgs = [];
-        aiMessages.querySelectorAll('.ai-msg').forEach(el => {
-            if (el.classList.contains('user')) {
-                msgs.push({ t: 'u', text: el.querySelector('.ai-bubble').textContent });
-            } else {
-                const ing = [...el.querySelectorAll('.ai-ingredient-name')].map(e => e.textContent);
-                msgs.push({ t: 'b', html: el.querySelector('.ai-bubble').innerHTML, ing });
-            }
-        });
-        try { localStorage.setItem(CHAT_STORE, JSON.stringify({ msgs, history: aiHistory, at: Date.now() })); } catch(e) {}
-    }
-
-    function loadChatHistory() {
-        try {
-            const raw = localStorage.getItem(CHAT_STORE);
-            if (!raw) return;
-            const { msgs, history, at } = JSON.parse(raw);
-            if (!msgs || msgs.length === 0) return;
-            if (Date.now() - at > 7 * 24 * 60 * 60 * 1000) { localStorage.removeItem(CHAT_STORE); return; }
-            document.querySelector('.ai-welcome')?.remove();
-            renderMsgsInto(msgs, history);
-        } catch(e) { localStorage.removeItem(CHAT_STORE); }
-    }
-
-    function clearChat() {
-        localStorage.removeItem(CHAT_STORE);
-        aiHistory = [];
-        aiMessages.innerHTML = `
-            <div class="ai-welcome">
-                <p>Hallo! Ich bin dein KI-Koch-Assistent.</p>
-                <p>Frag mich nach Rezepten oder was du kochen kannst!</p>
-                <div class="ai-suggestions">
-                    <button class="ai-suggestion-chip" data-msg="Was kann ich heute Abend kochen?">Was kann ich heute kochen?</button>
-                    <button class="ai-suggestion-chip" data-msg="Schlage mir ein einfaches Rezept vor">Einfaches Rezept vorschlagen</button>
-                    <button class="ai-suggestion-chip" data-msg="Was kann ich mit Hackfleisch kochen?">Rezept mit Hackfleisch</button>
-                    <button class="ai-suggestion-chip" data-msg="Gesundes Abendessen für die Familie">Gesundes Familienessen</button>
-                </div>
-            </div>`;
-        aiMessages.querySelectorAll('.ai-suggestion-chip').forEach(c =>
-            c.addEventListener('click', () => { aiInput.value = c.dataset.msg; sendMessage(); })
-        );
-    }
-
-    // Drawer
-    const openAi  = () => {
-        if (!chatLoaded) { chatLoaded = true; loadChatHistory(); }
-        aiDrawer.classList.add('active');
-        aiOverlay.classList.add('active');
-        setTimeout(() => aiInput.focus(), 300);
-    };
-    const closeAi = () => { aiDrawer.classList.remove('active'); aiOverlay.classList.remove('active'); };
-    aiFab.addEventListener('click', openAi);
-    document.getElementById('aiDrawerClose').addEventListener('click', closeAi);
-    aiOverlay.addEventListener('click', closeAi);
-    document.querySelectorAll('.ai-suggestion-chip').forEach(c =>
-        c.addEventListener('click', () => { aiInput.value = c.dataset.msg; sendMessage(); })
-    );
-    document.getElementById('aiListSelectCancel').addEventListener('click', () => hideModal('aiListSelectModal'));
-    document.getElementById('aiListSelectModal').addEventListener('click', e => { if (e.target.id === 'aiListSelectModal') hideModal('aiListSelectModal'); });
-
-    // Hilfsfunktionen
-    const esc      = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    const scrollDown = () => requestAnimationFrame(() => { aiMessages.scrollTop = aiMessages.scrollHeight; });
-
-    // Markdown → HTML
-    function toHtml(text) {
-        let html = '', ul = false, ol = false;
-        const close = () => { if(ul){html+='</ul>';ul=false;} if(ol){html+='</ol>';ol=false;} };
-        const safe  = s => esc(s).replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').replace(/\*(.+?)\*/g,'<em>$1</em>');
-        for (const line of text.split('\n')) {
-            const h  = line.match(/^#{1,3} (.+)/);
-            const li = line.match(/^[-•*] (.+)/);
-            const lo = line.match(/^\d+\. (.+)/);
-            if      (h)          { close(); html += `<h3>${safe(h[1])}</h3>`; }
-            else if (li)         { if(ol){html+='</ol>';ol=false;} if(!ul){html+='<ul>';ul=true;} html+=`<li>${safe(li[1])}</li>`; }
-            else if (lo)         { if(ul){html+='</ul>';ul=false;} if(!ol){html+='<ol>';ol=true;} html+=`<li>${safe(lo[1])}</li>`; }
-            else if (line.trim()){ close(); html += `<p>${safe(line)}</p>`; }
-            else                 { close(); }
-        }
-        close();
-        return html;
-    }
-
-    // Zutaten aus Rezeptantwort extrahieren
-    function parseIngredients(text) {
-        const m = text.match(/##\s*Zutaten[^\n]*\n([\s\S]*?)(?=\n##|$)/i);
-        if (!m) return [];
-        return m[1].split('\n').map(l => l.trim().replace(/^[-•*]\s+/,'').trim()).filter(l => l.length > 1 && l.length < 100 && !/^#/.test(l));
-    }
-
-    // Bubbles
-    function addUserBubble(text) {
-        document.querySelector('.ai-welcome')?.remove();
-        aiMessages.insertAdjacentHTML('beforeend', `<div class="ai-msg user"><div class="ai-bubble">${esc(text)}</div></div>`);
-        scrollDown();
-    }
-
-    function addBotBubble() {
-        document.querySelector('.ai-welcome')?.remove();
-        const wrap = document.createElement('div');
-        wrap.className = 'ai-msg bot';
-        wrap.innerHTML = '<div class="ai-bubble"><div class="ai-thinking-dots"><span></span><span></span><span></span></div></div>';
-        aiMessages.appendChild(wrap);
-        scrollDown();
-        return { msgDiv: wrap, bubble: wrap.querySelector('.ai-bubble') };
-    }
-
-    // Zutaten-Karte (ein-/ausklappbar)
-    function addIngredientCard(msgDiv, ingredients) {
-        if (!ingredients.length) return;
-        const items = ingredients.map(name => ({ name, owned: false }));
-        let expanded = false;
-
-        const card = document.createElement('div');
-        card.className = 'ai-ingredients-card';
-        card.innerHTML = `
-            <div class="ai-ingredients-header ai-ingredients-toggle" style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;">
-                <div style="display:flex;align-items:center;gap:6px;">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
-                    Zutaten
-                    <span style="background:var(--primary);color:#fff;font-size:11px;font-weight:700;padding:1px 7px;border-radius:20px;line-height:1.6;">${items.length}</span>
-                </div>
-                <svg class="ai-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="transition:transform 0.2s ease;flex-shrink:0;"><polyline points="6 9 12 15 18 9"/></svg>
-            </div>
-            <div class="ai-ingredient-list" style="display:none;"></div>
-            <button class="ai-add-btn" style="display:none;"></button>`;
-
-        const list    = card.querySelector('.ai-ingredient-list');
-        const btn     = card.querySelector('.ai-add-btn');
-        const header  = card.querySelector('.ai-ingredients-toggle');
-        const chevron = card.querySelector('.ai-chevron');
-
-        const refresh = () => {
-            const n = items.filter(i => !i.owned).length;
-            btn.disabled = n === 0;
-            btn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> Zur Einkaufsliste <span class="ai-add-count">${n}</span>`;
-        };
-
-        header.addEventListener('click', () => {
-            expanded = !expanded;
-            list.style.display = expanded ? '' : 'none';
-            btn.style.display  = expanded ? '' : 'none';
-            chevron.style.transform = expanded ? 'rotate(180deg)' : 'rotate(0deg)';
-        });
-
-        items.forEach(item => {
-            const row = document.createElement('div');
-            row.className = 'ai-ingredient-row';
-            row.innerHTML = `<div class="ai-ingredient-check"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div><span class="ai-ingredient-name">${esc(item.name)}</span>`;
-            row.addEventListener('click', () => { item.owned = !item.owned; row.classList.toggle('owned', item.owned); refresh(); });
-            list.appendChild(row);
-        });
-
-        refresh();
-        btn.addEventListener('click', () => {
-            const toAdd = items.filter(i => !i.owned).map(i => i.name);
-            if (toAdd.length) showListPicker(toAdd);
-        });
-        msgDiv.appendChild(card);
-    }
-
-    // Listen-Auswahl
-    function showListPicker(itemNames) {
-        const container = document.getElementById('aiListSelectContainer');
-        const noMsg     = document.getElementById('aiNoListsMsg');
-        container.innerHTML = '';
-        if (!AppState.lists.length) {
-            noMsg.style.display = 'block'; container.style.display = 'none';
-        } else {
-            noMsg.style.display = 'none'; container.style.display = 'flex';
-            AppState.lists.forEach(list => {
-                const el = document.createElement('button');
-                el.type = 'button';
-                el.className = 'select-list-item';
-                el.innerHTML = `<strong style="font-size:16px">${escapeHtml(list.name)}</strong><span>${list.productCount || 0} Produkte</span>`;
-                el.addEventListener('click', async () => {
-                    hideModal('aiListSelectModal');
-                    for (const name of itemNames) await AppState.addProduct(list.id, name, 'sonstiges');
-                    const toast = document.createElement('div');
-                    toast.style.cssText = 'position:fixed;bottom:110px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.85);color:#fff;padding:12px 20px;border-radius:20px;font-size:14px;z-index:9999;pointer-events:none;white-space:nowrap;';
-                    toast.textContent = `${itemNames.length} Zutat${itemNames.length !== 1 ? 'en' : ''} zu „${list.name}" hinzugefügt ✓`;
-                    document.body.appendChild(toast);
-                    setTimeout(() => toast.remove(), 3000);
-                });
-                container.appendChild(el);
-            });
-        }
-        showModal('aiListSelectModal');
-    }
-
-    // Nachricht senden
-    async function sendMessage() {
-        const text = aiInput.value.trim();
-        if (!text || aiSendBtn.disabled) return;
-
-        aiInput.value        = '';
-        aiSendBtn.disabled   = true;
-        aiStatus.textContent = 'Denkt nach…';
-        aiStatus.className   = 'ai-drawer-status thinking';
-
-        addUserBubble(text);
-        aiHistory.push({ role: 'user', content: text });
-        const { msgDiv, bubble } = addBotBubble();
-
-        try {
-            const res = await fetch(GROQ_PROXY, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    model: 'llama-3.1-8b-instant',
-                    messages: [
-                        { role: 'system', content: buildSystemPrompt() },
-                        ...aiHistory
-                    ],
-                    max_tokens: 800,
-                    temperature: 0.7
-                })
-            });
-
-            if (!res.ok) {
-                const errData = await res.json().catch(() => ({}));
-                throw new Error(errData.error?.message || 'HTTP ' + res.status);
-            }
-
-            const data = await res.json();
-            const full = data.choices[0]?.message?.content?.trim() || '';
-            if (!full) throw new Error('Keine Antwort erhalten');
-
-            // <action>-Blöcke ausführen (Produkte hinzufügen)
-            const actionMatch = full.match(/<action>([\s\S]*?)<\/action>/);
-            if (actionMatch) {
-                try {
-                    const cmd = JSON.parse(actionMatch[1]);
-                    if (cmd.type === 'add' && Array.isArray(cmd.ops)) {
-                        for (const op of cmd.ops) {
-                            const list = resolveList(op.list);
-                            if (!list) continue;
-                            const items = cleanItems(op.items);
-                            if (items.length) {
-                                await Promise.all(items.map(it => AppState.addProduct(list.id, it, 'sonstiges')));
-                            }
-                        }
-                    }
-                } catch(e) {}
-            }
-            const displayText = full.replace(/<action>[\s\S]*?<\/action>/g, '').trim();
-
-            bubble.innerHTML = toHtml(displayText || full);
-            requestAnimationFrame(() => {
-                aiMessages.scrollTo({ top: msgDiv.offsetTop - 12, behavior: 'smooth' });
-            });
-            aiHistory.push({ role: 'assistant', content: full });
-            addIngredientCard(msgDiv, parseIngredients(displayText));
-            saveChatHistory();
-
-        } catch (err) {
-            console.error('KI-Fehler:', err);
-            aiHistory.pop();
-            bubble.innerHTML = `<p style="color:#FF3B30;font-size:13px;font-weight:600">Fehler: ${esc(err.message)}</p><p style="font-size:12px;color:#8E8E93;margin-top:4px">Nochmal senden.</p>`;
-        }
-
-        aiStatus.textContent = 'Online';
-        aiStatus.className   = 'ai-drawer-status';
-        aiSendBtn.disabled   = false;
-        aiInput.focus();
-    }
-
-    aiSendBtn.addEventListener('click', sendMessage);
-    aiInput.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } });
-    document.getElementById('aiClearBtn').addEventListener('click', () => { archiveCurrentChat(); clearChat(); });
-
-    // ===== CHAT-VERLAUF PANEL =====
-    const SESSIONS_STORE = 'ki_sessions_v1';
-    const MAX_SESSIONS   = 15;
-    const historyPanel   = document.getElementById('aiHistoryPanel');
-    const historyList    = document.getElementById('aiHistoryList');
-
-    function getSessions() {
-        try { return JSON.parse(localStorage.getItem(SESSIONS_STORE) || '[]'); }
-        catch { return []; }
-    }
-
-    function archiveCurrentChat() {
-        try {
-            const raw = localStorage.getItem(CHAT_STORE);
-            if (!raw) return;
-            const { msgs, history, at } = JSON.parse(raw);
-            if (!msgs || msgs.length === 0) return;
-            const preview = msgs.find(m => m.t === 'u')?.text || '…';
-            const userCount = msgs.filter(m => m.t === 'u').length;
-            const id = (at || Date.now()).toString(36) + '_' + Math.random().toString(36).slice(2, 6);
-            localStorage.setItem('ki_sess_' + id, JSON.stringify({ msgs, history }));
-            const sessions = getSessions();
-            // avoid duplicate (same timestamp)
-            if (!sessions.find(s => s.id === id)) {
-                sessions.unshift({ id, at: at || Date.now(), preview, userCount });
-                const removed = sessions.splice(MAX_SESSIONS);
-                removed.forEach(s => { try { localStorage.removeItem('ki_sess_' + s.id); } catch(e){} });
-                localStorage.setItem(SESSIONS_STORE, JSON.stringify(sessions));
-            }
-        } catch(e) {}
-    }
-
-    function fmtDate(ts) {
-        const d = new Date(ts);
-        const now = new Date();
-        const diffMs = now - d;
-        const diffDays = Math.floor(diffMs / 86400000);
-        if (diffDays === 0) return 'Heute, ' + d.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
-        if (diffDays === 1) return 'Gestern, ' + d.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
-        return d.toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit', year: 'numeric' }) + ', ' + d.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
-    }
-
-    function renderMsgsInto(msgs, history) {
-        aiMessages.innerHTML = '';
-        aiHistory = history || [];
-        msgs.forEach(m => {
-            const wrap = document.createElement('div');
-            if (m.t === 'u') {
-                wrap.className = 'ai-msg user';
-                wrap.innerHTML = `<div class="ai-bubble">${esc(m.text)}</div>`;
-                aiMessages.appendChild(wrap);
-            } else {
-                wrap.className = 'ai-msg bot';
-                const bubble = document.createElement('div');
-                bubble.className = 'ai-bubble';
-                bubble.innerHTML = m.html;
-                wrap.appendChild(bubble);
-                aiMessages.appendChild(wrap);
-                if (m.ing && m.ing.length > 0) addIngredientCard(wrap, m.ing);
-            }
-        });
-        aiMessages.scrollTop = aiMessages.scrollHeight;
-    }
-
-    function deleteSession(id) {
-        try {
-            localStorage.removeItem('ki_sess_' + id);
-            const updated = getSessions().filter(s => s.id !== id);
-            localStorage.setItem(SESSIONS_STORE, JSON.stringify(updated));
-        } catch(e) {}
-    }
-
-    function showHistoryPanel() {
-        const sessions = getSessions();
-        historyList.innerHTML = '';
-        if (sessions.length === 0) {
-            historyList.innerHTML = `<div class="ai-history-empty">Noch keine alten Chats gespeichert.<br><br>Starte ein Gespräch — es wird hier automatisch gespeichert.</div>`;
-        } else {
-            sessions.forEach(s => {
-                const card = document.createElement('div');
-                card.className = 'ai-history-card';
-                const n = s.userCount || 1;
-                card.innerHTML = `
-                    <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;">
-                        <div style="min-width:0;flex:1;">
-                            <div class="ai-history-card-date">${fmtDate(s.at)}</div>
-                            <div class="ai-history-card-preview">${esc(s.preview)}</div>
-                            <div class="ai-history-card-count">${n} Nachricht${n !== 1 ? 'en' : ''}</div>
-                        </div>
-                        <button class="ai-history-delete" title="Chat löschen" style="flex-shrink:0;width:32px;height:32px;border:none;background:none;cursor:pointer;color:var(--text-secondary);border-radius:8px;display:flex;align-items:center;justify-content:center;padding:0;">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
-                        </button>
-                    </div>`;
-                card.querySelector('.ai-history-delete').addEventListener('click', e => {
-                    e.stopPropagation();
-                    deleteSession(s.id);
-                    card.remove();
-                    if (!historyList.querySelector('.ai-history-card')) {
-                        historyList.innerHTML = `<div class="ai-history-empty">Noch keine alten Chats gespeichert.<br><br>Starte ein Gespräch — es wird hier automatisch gespeichert.</div>`;
-                    }
-                });
-                card.addEventListener('click', () => {
-                    try {
-                        const raw = localStorage.getItem('ki_sess_' + s.id);
-                        if (!raw) return;
-                        const { msgs, history } = JSON.parse(raw);
-                        renderMsgsInto(msgs, history);
-                        saveChatHistory();
-                    } catch(e) {}
-                    historyPanel.classList.remove('open');
-                });
-                historyList.appendChild(card);
-            });
-        }
-        historyPanel.classList.add('open');
-    }
-
-    document.getElementById('aiHistoryBtn').addEventListener('click', showHistoryPanel);
-    document.getElementById('aiHistoryBack').addEventListener('click', () => historyPanel.classList.remove('open'));
-
-    // ===== SPRACHSTEUERUNG =====
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    const voiceFab = document.getElementById('voiceFab');
-    if (!SpeechRecognition) {
-        if (voiceFab) voiceFab.style.display = 'none';
-    } else {
-        const rec = new SpeechRecognition();
-        rec.lang = 'de-DE';
-        rec.interimResults = false;
-        rec.maxAlternatives = 3;
-        let isRecording = false;
-
-        // Normalize: lowercase, remove umlauts for fuzzy matching, strip fillers
-        function normVoice(s) {
-            return s.toLowerCase()
-                .replace(/[äÄ]/g,'a').replace(/[öÖ]/g,'o').replace(/[üÜ]/g,'u').replace(/ß/g,'ss')
-                .replace(/\b(ahm|ahh|ah|äh|ähm|ähh|halt|mal|bitte|einfach|irgendwie|so|da|noch|doch|und|die|der|das|ein|eine|einen)\b/g,' ')
-                .replace(/\s+/g,' ').trim();
-        }
-
-        // Find the best matching list by fuzzy search in text
-        function findListIn(text) {
-            const norm = normVoice(text);
-            if (!AppState.lists.length) return null;
-            // 1. full name contained
-            for (const l of AppState.lists) {
-                if (norm.includes(normVoice(l.name))) return l;
-            }
-            // 2. any word of list name (len > 2) found in text
-            for (const l of AppState.lists) {
-                const words = normVoice(l.name).split(/\s+/).filter(w => w.length > 2);
-                if (words.some(w => norm.includes(w))) return l;
-            }
-            // 3. text starts with part of a list name
-            for (const l of AppState.lists) {
-                const ln = normVoice(l.name);
-                if (ln.length > 2 && norm.startsWith(ln.slice(0, Math.min(4, ln.length)))) return l;
-            }
-            return null;
-        }
-
-        // Remove the list reference from text to isolate the item
-        function stripListRef(text, list) {
-            let s = normVoice(text);
-            const ln = normVoice(list.name);
-            // remove keywords + list name
-            s = s.replace(new RegExp('(?:auf|zur?|in\\s+die|in|an)?\\s*(?:die\\s+)?liste\\s+' + ln.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'), 'gi'), '');
-            s = s.replace(new RegExp(ln, 'gi'), '');
-            // remove trailing/leading action words
-            s = s.replace(/\b(f[üu]ge?|hinzu|auf|zur?|in|liste|mach|schreib|notier|add|trag|ein)\b/gi, '');
-            return s.replace(/\s+/g,' ').trim();
-        }
-
-        function isQuestion(text) {
-            return /\b(was\s+ist|was\s+sind|was\s+bedeutet|wie\s+macht|wie\s+geht|wie\s+viel|warum|wann\s+ist|wer\s+ist|wo\s+ist|woher|wohin|kannst\s+du|kann\s+ich|k[öo]nntest\s+du|hilf\s+mir|erkl[äa]r|sag\s+mir|zeig\s+mir|empfiehl|erz[äa]hl|berechne|rechne|[üu]bersetze|schreib\s+mir\s+(?:ein|eine)|was\s+kann\s+ich|was\s+soll\s+ich|was\s+wei[ßs]t)\b/i.test(text)
-                || text.trim().endsWith('?');
-        }
-
-        // Wörter die niemals ein Artikel sein können
-        const FORBIDDEN_ITEM = /^(zur?|auf|in|an|die|der|das|ein|eine|einen|liste|hinzu|f[üu]ge?|mach|schreib|add|trag|notier|und|oder|mit|von|nach|bei|für|um|aus|über|unter|neben|zwischen)$/i;
-
-        function isValidItem(s) {
-            if (!s || s.length < 2) return false;
-            // Alle Wörter müssen erlaubt sein
-            return s.split(/\s+/).every(w => !FORBIDDEN_ITEM.test(w));
-        }
-
-        function tryAddCommand(transcript) {
-            if (isQuestion(transcript)) return false;
-
-            // Filler-Wörter entfernen
-            let clean = transcript
-                .replace(/\b(ahm|ahh|ah|[äa]hm|[äa]hh|halt|eben|quasi|sozusagen|eigentlich|irgendwie)\b/gi, ' ')
-                .replace(/\s+/g, ' ').trim();
-
-            // Muss mindestens ein Einkaufs-Signal ODER bekannte Liste ODER sehr kurz sein
-            const hasSignal = /\b(f[üu]ge?|hinzu|kauf|hol|pack|schreib|notier|brauch|vergiss|vergessen|besorg|bestell|trag|setz|stell|merk|liste|einpack|besorgen|kaufen|holen|bestellen|m[öo]chte|wollen|brauchen)\b/i.test(clean);
-            const hasListRef = findListIn(clean) !== null;
-            if (!hasSignal && !hasListRef && clean.split(/\s+/).length > 4) return false;
-
-            // --- Schritt 1: Listenverweis isolieren und entfernen ---
-            let list = null;
-            const listMatch = clean.match(/\b(?:auf\s+(?:die\s+)?|zur?\s+(?:die\s+)?|in\s+(?:die\s+)?)liste\s+(\S+(?:\s+\S+)?)(?=\s*(?:hinzu|ein|auf|$))/i)
-                || clean.match(/\bliste\s+(\S+(?:\s+\S+)?)(?:\s|$)/i);
-            if (listMatch) {
-                list = findListIn(listMatch[1]);
-                clean = clean.replace(listMatch[0], ' ').replace(/\s+/g, ' ').trim();
-            }
-            if (!list) {
-                const found = findListIn(clean);
-                if (found) { list = found; clean = stripListRef(clean, found); }
-            }
-
-            // --- Schritt 2: Aktionswörter (Präfix + Suffix) abstreifen ---
-            let item = clean
-                // Präfixe — alle Arten wie man "hinzufügen" ausdrücken kann
-                .replace(/^f[üu]ge?\s+/i, '')
-                .replace(/^(?:kauf(?:e)?|besorg(?:e)?|bestell(?:e)?)\s+(?:noch\s+|bitte\s+|mir\s+|uns\s+|dir\s+)*/i, '')
-                .replace(/^(?:hol(?:e)?)\s+(?:noch\s+|bitte\s+|mir\s+|uns\s+)*/i, '')
-                .replace(/^(?:pack(?:e)?)\s+(?:noch\s+)?/i, '')
-                .replace(/^(?:schreib(?:e)?)\s+(?:noch\s+|bitte\s+)*/i, '')
-                .replace(/^(?:notier(?:e)?|trag\s+ein|trage\s+ein)\s+/i, '')
-                .replace(/^(?:wir\s+brauchen|ich\s+brauche)\s+(?:noch\s+|dringend\s+|unbedingt\s+)*/i, '')
-                .replace(/^(?:wir\s+(?:m[öo]chten|wollen|h[äa]tten\s+gern)|ich\s+(?:m[öo]chte|will|h[äa]tte\s+gern))\s+/i, '')
-                .replace(/^(?:merk\s+(?:dir|euch|uns)|merke\s+(?:dir|euch|uns))\s+/i, '')
-                .replace(/^(?:tu(?:e)?|tus|leg(?:e)?|setz(?:e)?|stell(?:e)?)\s+/i, '')
-                .replace(/^(?:vergiss\s+nicht|nicht\s+vergessen)\s*[:,]?\s*/i, '')
-                .replace(/^(?:ich\s+brauche\s+noch|wir\s+brauchen\s+noch)\s+/i, '')
-                // Suffixe
-                .replace(/\s+hinzu$/i, '')
-                .replace(/\s+ein$/i, '')
-                .replace(/\s+(?:kaufen|besorgen|holen|bestellen|einpacken|aufschreiben|hinzuf[üu]gen|eintragen|notieren|einf[üu]gen)$/i, '')
-                .replace(/\s+nicht\s+vergessen$/i, '')
-                .replace(/\s+(?:auf|in|zur?)\s+(?:die\s+)?(?:liste\s*\S*|einkaufsliste)$/i, '')
-                .replace(/\s+(?:kommt?|muss|soll)\s+(?:noch\s+)?(?:auf|in)\s+(?:die\s+)?liste$/i, '')
-                .replace(/\s+auf\s+die\s+liste$/i, '')
-                .replace(/\s+auf$/i, '')
-                // Verbleibende Füller
-                .replace(/\b(bitte|noch|dringend|schnell|kurz|unbedingt)\b/gi, '')
-                .replace(/\s+/g, ' ').trim();
-
-            if (!isValidItem(item)) return false;
-            if (!list) list = AppState.lists[0];
-            if (!list) return false;
-
-            // Mehrere Artikel aufteilen: "Milch, Bananen und Brot" → ["Milch", "Bananen", "Brot"]
-            const items = item
-                .split(/\s*,\s*|\s+und\s+|\s+sowie\s+|\s+außerdem\s+/i)
-                .map(s => s.trim())
-                .filter(s => isValidItem(s))
-                .map(s => s.charAt(0).toUpperCase() + s.slice(1));
-
-            if (items.length === 0) return false;
-
-            Promise.all(items.map(it => AppState.addProduct(list.id, it, 'sonstiges'))).then(() => {
-                const toast = document.createElement('div');
-                toast.style.cssText = 'position:fixed;bottom:110px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.85);color:#fff;padding:12px 20px;border-radius:20px;font-size:14px;z-index:9999;pointer-events:none;white-space:nowrap;';
-                toast.textContent = items.length === 1
-                    ? `„${items[0]}" zu „${list.name}" hinzugefügt ✓`
-                    : `${items.length} Artikel zu „${list.name}" hinzugefügt ✓`;
-                document.body.appendChild(toast);
-                setTimeout(() => toast.remove(), 3000);
-            });
-            return true;
-        }
-
-        // Groß/Kleinschreibung normalisieren: ersten Buchstaben groß, Rest klein
-        // Kurze Abkürzungen (HH, DM, Bio) bleiben wie sie sind
-        function fixCase(s) {
-            return s.split(/\s+/).map(w => {
-                if (w.length <= 3 && w === w.toUpperCase()) return w; // Abkürzung
-                return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
-            }).join(' ');
-        }
-
-        function resolveList(name) {
-            if (!name || !AppState.lists.length) return AppState.lists[0] || null;
-            const n = normVoice(name);
-            return AppState.lists.find(l => l.name === name)
-                // normalisierter exakter Match
-                || AppState.lists.find(l => normVoice(l.name) === n)
-                // AI gibt längeren Namen zurück als Liste heißt: "Einkaufsliste" → Liste "Einkauf"
-                || AppState.lists.find(l => n.includes(normVoice(l.name)) && normVoice(l.name).length > 2)
-                // Liste enthält den gesuchten Namen: "DM Markt" → gesucht "DM"
-                || AppState.lists.find(l => normVoice(l.name).includes(n) && n.length > 2)
-                // erstes Wort des Listennamens reicht: "Einkauf" findet "Einkauf Rewe"
-                || AppState.lists.find(l => normVoice(l.name).split(' ')[0] === n.split(' ')[0] && n.length > 2)
-                || AppState.lists[0];
-        }
-
-        // Befehlswörter aus Artikelnamen entfernen (KI gibt manchmal “Milch kaufen” statt “Milch” zurück)
-        function sanitizeItemName(s) {
-            return s
-                .replace(/\b(f[üu]ge?|hinzu|ein|auf|kauf(?:en)?|hol(?:en)?|besorg(?:en)?|bestell(?:en)?|notier(?:en)?|schreib(?:en)?|nicht vergessen|vergiss nicht|bitte|zur liste|auf die liste|in die liste)\b/gi, '')
-                .replace(/\s+/g, ' ').trim();
-        }
-
-        // Sendet Sprachbefehl still an die KI (keine Anzeige, kein Speichern)
-        async function silentAI(transcript) {
-            if (!AppState.lists?.length) throw new Error('Keine Listen');
-            const res = await fetch(GROQ_PROXY, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    model: 'llama-3.1-8b-instant',
-                    messages: [
-                        { role: 'system', content: buildSystemPrompt() },
-                        { role: 'user', content: transcript }
-                    ],
-                    max_tokens: 300,
-                    temperature: 0.1
-                })
-            });
-            if (!res.ok) throw new Error('HTTP ' + res.status);
-            const data = await res.json();
-            return (data.choices[0]?.message?.content || '').trim();
-        }
-
-        // Führt <action>-Blöcke aus der KI-Antwort aus, gibt Anzahl der hinzugefügten Produkte zurück
-        async function executeActionsFromAI(text, transcript) {
-            const match = text.match(/<action>([\s\S]*?)<\/action>/);
-            if (!match) return 0;
-            try {
-                const cmd = JSON.parse(match[1]);
-                if (cmd.type !== 'add' || !Array.isArray(cmd.ops)) return 0;
-                let total = 0;
-                for (const op of cmd.ops) {
-                    const list = resolveList(op.list);
-                    if (!list) continue;
-                    const items = cleanItems(op.items, transcript);
-                    if (items.length) {
-                        await Promise.all(items.map(it => AppState.addProduct(list.id, it, 'sonstiges')));
-                        showVoiceToast(items, list.name);
-                        total += items.length;
-                    }
-                }
-                return total;
-            } catch(e) { return 0; }
-        }
-
-        function showVoiceToast(items, listName) {
-            const toast = document.createElement('div');
-            toast.style.cssText = 'position:fixed;bottom:110px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.85);color:#fff;padding:12px 20px;border-radius:20px;font-size:14px;z-index:9999;pointer-events:none;white-space:nowrap;';
-            toast.textContent = items.length === 1
-                ? `„${items[0]}” zu „${listName}” hinzugefügt ✓`
-                : `${items.length} Artikel zu „${listName}” hinzugefügt ✓`;
-            document.body.appendChild(toast);
-            setTimeout(() => toast.remove(), 3000);
-        }
-
-        // Prüft ob ein Item tatsächlich im Sprachbefehl erwähnt wurde (Anti-Halluzination)
-        function itemMentionedInTranscript(item, transcript) {
-            const t = normVoice(transcript);
-            const words = normVoice(item).split(/\s+/).filter(w => w.length > 2);
-            if (words.length === 0) return true;
-            return words.some(w => t.includes(w));
-        }
-
-        // Items aus AI-Antwort sauber machen
-        function cleanItems(raw, transcript) {
-            return (raw || [])
-                .map(s => fixCase(sanitizeItemName(String(s).trim())))
-                .filter(s => s.length > 1 && s.split(/\s+/).length <= 6)
-                .filter(s => !transcript || itemMentionedInTranscript(s, transcript));
-        }
-
-        rec.addEventListener('result', async e => {
-            voiceFab.classList.remove('recording');
-            voiceFab.classList.add('thinking');
-            const transcript = e.results[0][0].transcript.trim();
-
-            try {
-                const aiResponse = await silentAI(transcript);
-                const actionsCount = await executeActionsFromAI(aiResponse, transcript);
-
-                voiceFab.classList.remove('thinking');
-
-                if (actionsCount === 0) {
-                    // Keine Aktion erkannt → Chat öffnen und KI-Antwort anzeigen
-                    const cleanText = aiResponse.replace(/<action>[\s\S]*?<\/action>/g, '').trim();
-                    openAi();
-                    setTimeout(() => {
-                        if (cleanText) {
-                            addUserBubble(transcript);
-                            aiHistory.push({ role: 'user', content: transcript });
-                            const { msgDiv, bubble } = addBotBubble();
-                            bubble.innerHTML = toHtml(cleanText);
-                            aiHistory.push({ role: 'assistant', content: cleanText });
-                            addIngredientCard(msgDiv, parseIngredients(cleanText));
-                            saveChatHistory();
-                            aiMessages.scrollTo({ top: aiMessages.scrollHeight, behavior: 'smooth' });
-                        } else {
-                            aiInput.value = transcript;
-                            sendMessage();
-                        }
-                    }, 350);
-                }
-            } catch (err) {
-                // Netzwerk-Fehler → Regex als letzter Ausweg
-                voiceFab.classList.remove('thinking');
-                let handled = false;
-                for (let i = 0; i < e.results[0].length; i++) {
-                    if (tryAddCommand(e.results[0][i].transcript.trim())) { handled = true; break; }
-                }
-                if (!handled) {
-                    openAi();
-                    setTimeout(() => { aiInput.value = transcript; sendMessage(); }, 350);
-                }
-            }
-        });
-        rec.addEventListener('end', () => {
-            isRecording = false;
-            voiceFab.classList.remove('recording');
-        });
-        rec.addEventListener('error', () => {
-            isRecording = false;
-            voiceFab.classList.remove('recording');
-            voiceFab.classList.remove('thinking');
-        });
-
-        voiceFab.addEventListener('click', () => {
-            if (isRecording) { rec.stop(); }
-            else { isRecording = true; voiceFab.classList.add('recording'); rec.start(); }
-        });
-
-        const voiceFabChip = document.getElementById('voiceFabChip');
-        if (voiceFabChip) voiceFabChip.addEventListener('click', () => voiceFab.click());
-    }
 }
 
 // ===== LISTENSEITE =====
 if (isListPage) {
     let selectedCategory = 'sonstiges';
     let userManuallySelectedCategory = false;
-    let confirmCallback = null;
     let currentListId = null;
-    let currentProducts = [];
+    let allProducts = [];        // inkl. Papierkorb
+    let currentProducts = [];    // nur aktive
+    let serverConfirmed = false; // mindestens ein Stand direkt vom Server
     let pendingImageBase64 = null;
 
     const listTitle = document.getElementById('listTitle');
     const productInput = document.getElementById('productInput');
     const productsContainer = document.getElementById('productsContainer');
     const emptyState = document.getElementById('emptyState');
+    const syncHint = document.getElementById('syncHint');
     const fileInput = document.getElementById('fileInput');
     const cameraInput = document.getElementById('cameraInput');
     const categorySelector = document.getElementById('categorySelector');
+
+    attachDebugTrigger(listTitle);
 
     // ===== KATEGORIE CHIPS RENDERN =====
     function renderCategoryChips() {
@@ -1753,53 +1522,55 @@ if (isListPage) {
         }
         categorySelector.innerHTML = cats.map(cat => `
             <button class="category-chip ${cat.id === selectedCategory ? 'active' : ''}" data-category="${cat.id}">
-                ${cat.emoji} ${cat.name}
+                ${cat.emoji} ${escapeHtml(cat.name)}
             </button>
         `).join('');
-
-        categorySelector.querySelectorAll('.category-chip').forEach(chip => {
-            chip.addEventListener('click', () => {
-                categorySelector.querySelectorAll('.category-chip').forEach(c => c.classList.remove('active'));
-                chip.classList.add('active');
-                selectedCategory = chip.dataset.category;
-                userManuallySelectedCategory = true;
-            });
-        });
     }
 
-    // ===== ZULETZT GELÖSCHT MODAL =====
-    function renderRecentlyDeleted(items) {
+    categorySelector.addEventListener('click', (e) => {
+        const chip = e.target.closest('.category-chip');
+        if (!chip) return;
+        categorySelector.querySelectorAll('.category-chip').forEach(c => c.classList.remove('active'));
+        chip.classList.add('active');
+        selectedCategory = chip.dataset.category;
+        userManuallySelectedCategory = true;
+    });
+
+    // ===== PAPIERKORB (ZULETZT GELÖSCHT, 7 TAGE) =====
+    function trashItems() {
+        const cutoff = Date.now() - PRODUCT_TRASH_DAYS * 86400000;
+        return allProducts
+            .filter(p => p.deletedAt && tsMillis(p.deletedAt) > cutoff)
+            .sort((a, b) => tsMillis(b.deletedAt) - tsMillis(a.deletedAt));
+    }
+
+    function renderRecentlyDeleted() {
         const body = document.getElementById('recentlyDeletedBody');
-        if (!items || items.length === 0) {
-            body.innerHTML = `<div class="deleted-empty-state">Keine kürzlich gelöschten Produkte</div>`;
+        const items = trashItems();
+        if (items.length === 0) {
+            body.innerHTML = `<div class="deleted-empty-state">Keine gelöschten Produkte der letzten ${PRODUCT_TRASH_DAYS} Tage</div>`;
             return;
         }
         const rows = items.map(item => {
             const catInfo = AppState.getCategoryInfo(item.category || 'sonstiges');
-            const ms = item.deletedAt?.seconds ? Date.now() - item.deletedAt.seconds * 1000 : 0;
-            const mins = Math.max(0, Math.round(ms / 60000));
-            const time = mins === 0 ? 'Gerade eben' : `Vor ${mins} Min.`;
             return `<div class="deleted-product-item">
                 <div class="deleted-product-item-info">
                     <span class="deleted-product-item-name">${escapeHtml(item.name)}</span>
-                    <span class="deleted-product-item-meta">${catInfo.emoji} ${catInfo.name} · ${time}</span>
+                    <span class="deleted-product-item-meta">${catInfo.emoji} ${escapeHtml(catInfo.name)} · ${formatAgo(tsMillis(item.deletedAt))}</span>
                 </div>
                 <button class="restore-btn" data-product-id="${item.id}">Wiederherstellen</button>
             </div>`;
         }).join('');
         body.innerHTML = `<div class="deleted-product-list">${rows}</div>`;
-        body.querySelectorAll('.restore-btn').forEach(btn => {
-            btn.addEventListener('click', async () => {
-                btn.disabled = true;
-                btn.textContent = '…';
-                await AppState.restoreProduct(currentListId, btn.dataset.productId);
-                btn.closest('.deleted-product-item').remove();
-                if (!body.querySelector('.deleted-product-item')) {
-                    body.innerHTML = `<div class="deleted-empty-state">Keine kürzlich gelöschten Produkte</div>`;
-                }
-            });
-        });
     }
+
+    document.getElementById('recentlyDeletedBody').addEventListener('click', (e) => {
+        const btn = e.target.closest('.restore-btn');
+        if (!btn) return;
+        AppState.restoreProducts(currentListId, [btn.dataset.productId]);
+        btn.closest('.deleted-product-item').remove();
+        if (!document.querySelector('#recentlyDeletedBody .deleted-product-item')) renderRecentlyDeleted();
+    });
 
     // ===== KATEGORIEN BEARBEITEN MODAL =====
     function renderEditCategories() {
@@ -1809,14 +1580,9 @@ if (isListPage) {
         const defaultHtml = DEFAULT_CATEGORIES.map(cat => {
             const isHidden = AppState.hiddenDefaultCategories.includes(cat.id);
             return `
-                <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px;background:var(--background);border-radius:var(--radius);margin-bottom:6px;">
-                    <span style="font-size:16px;${isHidden ? 'opacity:0.4;text-decoration:line-through;' : ''}">${cat.emoji} ${cat.name}</span>
-                    <button class="toggle-default-btn"
-                        data-cat-id="${cat.id}"
-                        data-hidden="${isHidden}"
-                        style="border:none;border-radius:8px;padding:6px 12px;font-size:13px;font-weight:600;cursor:pointer;
-                        background:${isHidden ? 'var(--primary-light)' : 'var(--danger-light)'};
-                        color:${isHidden ? 'var(--primary)' : 'var(--danger)'};">
+                <div class="cat-edit-row">
+                    <span class="cat-edit-name ${isHidden ? 'is-hidden' : ''}">${cat.emoji} ${cat.name}</span>
+                    <button class="cat-edit-btn ${isHidden ? 'show' : 'hide'}" data-act="toggle" data-cat-id="${cat.id}" data-hidden="${isHidden}">
                         ${isHidden ? 'Einblenden' : 'Ausblenden'}
                     </button>
                 </div>
@@ -1825,154 +1591,216 @@ if (isListPage) {
 
         // Eigene Kategorien
         const customHtml = AppState.customCategories.length > 0
-            ? `<div style="margin-top:12px;margin-bottom:6px;font-size:13px;font-weight:600;color:var(--text-secondary);text-transform:uppercase;letter-spacing:0.5px;">Eigene Kategorien</div>`
+            ? `<div class="cat-edit-section">Eigene Kategorien</div>`
             + AppState.customCategories.map(cat => `
-                <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px;background:var(--background);border-radius:var(--radius);margin-bottom:6px;">
-                    <span style="font-size:16px;">${cat.emoji} ${cat.name}</span>
-                    <button class="delete-cat-btn" data-cat-id="${cat.id}"
-                        style="background:var(--danger-light);color:var(--danger);border:none;border-radius:8px;padding:6px 12px;font-size:13px;font-weight:600;cursor:pointer;">
-                        Löschen
-                    </button>
+                <div class="cat-edit-row">
+                    <span class="cat-edit-name">${cat.emoji} ${escapeHtml(cat.name)}</span>
+                    <button class="cat-edit-btn hide" data-act="delete" data-cat-id="${cat.id}">Löschen</button>
                 </div>
             `).join('')
             : '';
 
         listEl.innerHTML = `
-            <div style="margin-bottom:6px;font-size:13px;font-weight:600;color:var(--text-secondary);text-transform:uppercase;letter-spacing:0.5px;">Standard-Kategorien</div>
+            <div class="cat-edit-section">Standard-Kategorien</div>
             ${defaultHtml}
             ${customHtml}
         `;
-
-        // Ausblenden / Einblenden
-        listEl.querySelectorAll('.toggle-default-btn').forEach(btn => {
-            btn.addEventListener('click', async () => {
-                const catId = btn.dataset.catId;
-                const isHidden = btn.dataset.hidden === 'true';
-                if (isHidden) {
-                    await AppState.showDefaultCategory(currentListId, catId);
-                } else {
-                    await AppState.hideDefaultCategory(currentListId, catId);
-                    if (selectedCategory === catId) selectedCategory = 'sonstiges';
-                }
-                renderCategoryChips();
-                renderEditCategories();
-            });
-        });
-
-        // Eigene löschen
-        listEl.querySelectorAll('.delete-cat-btn').forEach(btn => {
-            btn.addEventListener('click', async () => {
-                const catId = btn.dataset.catId;
-                await AppState.deleteCustomCategory(currentListId, catId);
-                if (selectedCategory === catId) selectedCategory = 'sonstiges';
-                renderCategoryChips();
-                renderEditCategories();
-            });
-        });
     }
 
-    // ===== LISTE RENDERN =====
-    function renderList(list, products) {
-        if (!list) return;
-        listTitle.textContent = list.name || 'Einkaufsliste';
-        document.title = (list.name || 'Einkaufsliste') + ' - Einkaufsliste';
+    document.getElementById('categoriesList').addEventListener('click', (e) => {
+        const btn = e.target.closest('.cat-edit-btn');
+        if (!btn) return;
+        const catId = btn.dataset.catId;
+        if (btn.dataset.act === 'toggle') {
+            if (btn.dataset.hidden === 'true') {
+                AppState.showDefaultCategory(currentListId, catId);
+            } else {
+                AppState.hideDefaultCategory(currentListId, catId);
+                if (selectedCategory === catId) selectedCategory = 'sonstiges';
+            }
+        } else {
+            AppState.deleteCustomCategory(currentListId, catId);
+            if (selectedCategory === catId) selectedCategory = 'sonstiges';
+        }
+        renderCategoryChips();
+        renderEditCategories();
+        renderList();
+    });
 
-        if (!products || products.length === 0) {
-            productsContainer.innerHTML = '';
-            emptyState.classList.add('visible');
+    // ===== LISTE RENDERN (Diff: nur Geändertes anfassen) =====
+    function setTitle() {
+        const name = AppState.activeList?.name || 'Einkaufsliste';
+        if (listTitle.textContent !== name) listTitle.textContent = name;
+        document.title = name + ' - Einkaufsliste';
+    }
+
+    function productRowHtml() {
+        return `
+            <span class="checkbox pcheck" aria-hidden="true">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+            </span>
+            <span class="product-name pname"></span>
+            <span class="product-qty"></span>
+            <button class="photo-link-btn" type="button" hidden>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+                Foto
+            </button>`;
+    }
+
+    function renderSkeleton() {
+        productsContainer.innerHTML = `
+            <div class="skeleton-group" aria-label="Liste wird geladen">
+                <div class="skeleton-line short"></div>
+                <div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div>
+            </div>`;
+        emptyState.classList.remove('visible');
+    }
+
+    function renderList() {
+        setTitle();
+        const products = currentProducts;
+        productsContainer.querySelectorAll('.skeleton-group').forEach(el => el.remove());
+
+        if (products.length === 0) {
+            productsContainer.querySelectorAll('.category-section').forEach(el => el.remove());
+            // „Leer“ nur, wenn der Server es bestätigt hat – sonst Ladeanzeige
+            if (serverConfirmed) emptyState.classList.add('visible');
+            else { emptyState.classList.remove('visible'); renderSkeleton(); }
+            updateProgress();
             return;
         }
-
         emptyState.classList.remove('visible');
 
-        const grouped = {};
         const allCats = [...DEFAULT_CATEGORIES, ...AppState.customCategories];
         const order = allCats.map(c => c.id);
-
+        const grouped = {};
         products.forEach(p => {
             const cat = (p.category && order.includes(p.category)) ? p.category : 'sonstiges';
-            if (!grouped[cat]) grouped[cat] = [];
-            grouped[cat].push(p);
+            (grouped[cat] = grouped[cat] || []).push(p);
         });
 
-        let html = '';
+        const sections = new Map([...productsContainer.querySelectorAll('.category-section')].map(el => [el.dataset.cat, el]));
+        const rows = new Map([...productsContainer.querySelectorAll('.product-item')].map(el => [el.dataset.productId, el]));
+        let sectionIndex = 0;
+
         order.forEach(catKey => {
-            if (grouped[catKey]?.length > 0) {
-                const info = AppState.getCategoryInfo(catKey);
-                html += `
-                    <div class="category-section">
-                        <div class="category-header group-head">
-                            <h3>${info.name}</h3>
-                            <span class="count">${grouped[catKey].length}</span>
-                        </div>
-                        <div class="products-list">
-                            ${grouped[catKey].map(p => `
-                                <button class="product-item pitem" data-product-id="${p.id}" aria-pressed="false" aria-label="${escapeHtml(p.name)} abhaken">
-                                    <span class="checkbox pcheck">
-                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round">
-                                            <polyline points="20 6 9 17 4 12"/>
-                                        </svg>
-                                    </span>
-                                    <span class="product-name pname">${escapeHtml(p.name)}</span>
-                                    ${p.imageUrl ? `
-                                        <button class="photo-link-btn" data-image="${encodeURIComponent(p.imageUrl)}" data-name="${escapeHtml(p.name)}">
-                                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
-                                                <circle cx="12" cy="13" r="4"/>
-                                            </svg>
-                                            Foto
-                                        </button>
-                                    ` : ''}
-                                </button>
-                            `).join('')}
-                        </div>
-                    </div>
-                `;
+            const items = grouped[catKey];
+            if (!items?.length) return;
+            let section = sections.get(catKey);
+            if (!section) {
+                section = document.createElement('div');
+                section.className = 'category-section';
+                section.dataset.cat = catKey;
+                section.innerHTML = `<div class="category-header group-head"><h3></h3><span class="count"></span></div><div class="products-list"></div>`;
             }
+            sections.delete(catKey);
+            const info = AppState.getCategoryInfo(catKey);
+            section.querySelector('h3').textContent = info.name;
+            section.querySelector('.count').textContent = items.length;
+            if (productsContainer.children[sectionIndex] !== section) {
+                productsContainer.insertBefore(section, productsContainer.children[sectionIndex] || null);
+            }
+            sectionIndex++;
+
+            const listEl = section.querySelector('.products-list');
+            items.forEach((p, i) => {
+                let row = rows.get(p.id);
+                if (!row) {
+                    row = document.createElement('div');
+                    row.className = 'product-item pitem';
+                    row.dataset.productId = p.id;
+                    row.setAttribute('role', 'button');
+                    row.setAttribute('tabindex', '0');
+                    row.setAttribute('aria-pressed', 'false');
+                    row.innerHTML = productRowHtml();
+                }
+                rows.delete(p.id);
+                const hasImage = !!(p.hasImage || p.imageUrl);
+                const sig = `${p.name}|${p.qty || ''}|${hasImage}`;
+                if (row.dataset.sig !== sig) {
+                    row.dataset.sig = sig;
+                    row.querySelector('.pname').textContent = p.name;
+                    row.querySelector('.product-qty').textContent = p.qty || '';
+                    row.querySelector('.photo-link-btn').hidden = !hasImage;
+                    row.setAttribute('aria-label', `${p.name}${p.qty ? ' ' + p.qty : ''} abhaken`);
+                }
+                if (listEl.children[i] !== row) listEl.insertBefore(row, listEl.children[i] || null);
+            });
         });
 
-        productsContainer.innerHTML = html;
-
-        productsContainer.querySelectorAll('.product-item').forEach(item => {
-            item.addEventListener('click', (e) => {
-                if (e.target.closest('.photo-link-btn')) return;
-                item.classList.remove('pop');
-                void item.offsetWidth;
-                item.classList.add('checking', 'pop');
-                item.setAttribute('aria-pressed', 'true');
-                setTimeout(() => {
-                    item.classList.add('checked');
-                    setTimeout(async () => {
-                        await AppState.removeProduct(currentListId, item.dataset.productId);
-                    }, 300);
-                }, 450);
-            });
-            item.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); item.click(); }
-            });
-        });
-
-        productsContainer.querySelectorAll('.photo-link-btn').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                const imageUrl = decodeURIComponent(btn.dataset.image);
-                const name = btn.dataset.name;
-                document.getElementById('photoViewImg').src = imageUrl;
-                document.getElementById('photoViewTitle').textContent = name;
-                showModal('photoViewModal');
-            });
-        });
+        sections.forEach(el => el.remove());
+        // Zeilen, die gerade abgehakt animiert werden, dürfen zu Ende laufen
+        rows.forEach(el => { if (!el.classList.contains('checking')) el.remove(); });
+        updateProgress();
     }
 
-    async function addProduct() {
+    function updateProgress() {
+        const label = document.getElementById('progressLabel');
+        if (label) label.textContent = currentProducts.length ? `${currentProducts.length} offen` : '';
+    }
+
+    // ===== ABHAKEN + FOTO (Event-Delegation) =====
+    function checkOff(row) {
+        if (row.classList.contains('checking')) return;
+        const id = row.dataset.productId;
+        const product = currentProducts.find(p => p.id === id);
+        row.classList.remove('pop');
+        void row.offsetWidth;
+        row.classList.add('checking', 'pop');
+        row.setAttribute('aria-pressed', 'true');
+        setTimeout(() => {
+            row.classList.add('checked');
+            setTimeout(() => {
+                AppState.removeProducts(currentListId, [id], 'abgehakt');
+                setTimeout(() => row.remove(), 50);
+                if (product) showUndo(`„${product.name}“ abgehakt`, () => AppState.restoreProducts(currentListId, [id]));
+            }, 300);
+        }, 450);
+    }
+
+    productsContainer.addEventListener('click', async (e) => {
+        const photoBtn = e.target.closest('.photo-link-btn');
+        const row = e.target.closest('.product-item');
+        if (!row) return;
+        if (photoBtn) {
+            e.stopPropagation();
+            const product = allProducts.find(p => p.id === row.dataset.productId);
+            if (!product) return;
+            const img = document.getElementById('photoViewImg');
+            img.removeAttribute('src');
+            document.getElementById('photoViewTitle').textContent = product.name;
+            showModal('photoViewModal');
+            const src = await AppState.loadImage(currentListId, product);
+            if (src) img.src = src;
+            else showToast('Foto ist offline nicht verfügbar');
+            return;
+        }
+        checkOff(row);
+    });
+
+    productsContainer.addEventListener('keydown', (e) => {
+        const row = e.target.closest('.product-item');
+        if (row && e.target === row && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); checkOff(row); }
+    });
+
+    // ===== PRODUKT HINZUFÜGEN =====
+    // Gleicher Name schon auf der Liste → nicht doppelt anlegen
+    function findActiveByName(name) {
+        const n = name.trim().toLocaleLowerCase('de');
+        return currentProducts.find(p => (p.name || '').trim().toLocaleLowerCase('de') === n);
+    }
+
+    function addProduct() {
         const name = productInput.value.trim();
         if (!name || !currentListId) return;
-        const success = await AppState.addProduct(currentListId, name, selectedCategory);
-        if (success) {
-            productInput.value = '';
-            productInput.focus();
-            userManuallySelectedCategory = false;
+        if (findActiveByName(name)) {
+            showToast(`„${name}“ steht schon auf der Liste`);
+        } else {
+            AppState.addProduct(currentListId, name, selectedCategory);
         }
+        productInput.value = '';
+        productInput.focus();
+        userManuallySelectedCategory = false;
     }
 
     function applyDetectedCategory(catId) {
@@ -2016,28 +1844,82 @@ if (isListPage) {
         }
     });
 
+    // ===== DATEN ABONNIEREN =====
+    function applyProducts(products, { fromCache, pending }) {
+        const active = products
+            .filter(p => !p.deletedAt)
+            .sort((a, b) => tsMillis(a.addedAt) - tsMillis(b.addedAt));
+        // Letzten guten Stand behalten: ein leerer Cache-Stand leert nie die Anzeige
+        if (fromCache && active.length === 0 && currentProducts.length > 0) {
+            syncHint?.classList.add('visible');
+            return;
+        }
+        allProducts = products;
+        currentProducts = active;
+        if (!fromCache) serverConfirmed = true;
+        syncHint?.classList.toggle('visible', fromCache);
+        renderList();
+
+        if (!fromCache || active.length) {
+            Mirror.set('products_' + currentListId, products.filter(p => !p.deletedAt || trashItems().includes(p)).map(stripForMirror));
+            if (AppState.activeList) DeviceBackup.saveList(AppState.activeList, active);
+        }
+        // Zähler am Listen-Dokument selbst reparieren (nur mit bestätigtem Server-Stand)
+        if (!fromCache && !pending && AppState.activeList && AppState.activeList.productCount !== active.length) {
+            AppState.activeList.productCount = active.length;
+            updateDoc(doc(db, "lists", currentListId), { productCount: active.length })
+                .catch(e => Debug.log('Zähler', e));
+        }
+    }
+
     function subscribeToList(listId) {
-        onSnapshot(doc(db, "lists", listId), (snap) => {
-            if (!snap.exists()) { window.location.href = 'index.html'; return; }
-            if (snap.data().familyId && snap.data().familyId !== currentFamilyId) {
+        // Sofort-Anzeige aus dem letzten guten Stand
+        const mirroredList = (Mirror.get('lists_' + currentFamilyId) || []).find(l => l.id === listId);
+        if (mirroredList) AppState.activeList = mirroredList;
+        const mirroredProducts = Mirror.get('products_' + listId);
+        if (mirroredProducts?.length) {
+            allProducts = mirroredProducts;
+            currentProducts = mirroredProducts.filter(p => !p.deletedAt).sort((a, b) => tsMillis(a.addedAt) - tsMillis(b.addedAt));
+            syncHint?.classList.add('visible');
+            renderList();
+        } else {
+            setTitle();
+            renderSkeleton();
+        }
+
+        liveListen('Liste', doc(db, "lists", listId), (snap) => {
+            if (!snap.exists()) {
+                // Nur nach Server-Bestätigung zurück zur Übersicht (neue Listen sind offline schon da)
+                if (!snap.metadata.fromCache && !new URLSearchParams(location.search).has('new')) window.location.href = 'index.html';
+                return;
+            }
+            const data = docData(snap);
+            if (data.familyId && data.familyId !== currentFamilyId) { window.location.href = 'index.html'; return; }
+            if (data.deletedAt && !snap.metadata.hasPendingWrites) {
                 window.location.href = 'index.html';
                 return;
             }
-            AppState.activeList = { id: snap.id, ...snap.data() };
-            renderList(AppState.activeList, currentProducts);
+            AppState.activeList = data;
+            setTitle();
         });
 
-        if (AppState.unsubscribeProducts) AppState.unsubscribeProducts();
+        // Produkte SOFORT abonnieren – Kategorien laufen parallel
+        liveListen('Produkte', collection(db, "lists", listId, "products"), (snap) => {
+            applyProducts(snap.docs.map(docData), {
+                fromCache: snap.metadata.fromCache,
+                pending: snap.metadata.hasPendingWrites
+            });
+        });
 
-        AppState.unsubscribeProducts = onSnapshot(
-            collection(db, "lists", listId, "products"),
-            (snapshot) => {
-                currentProducts = snapshot.docs
-                    .map(d => ({ id: d.id, ...d.data() }))
-                    .sort((a, b) => (a.addedAt?.seconds || 0) - (b.addedAt?.seconds || 0));
-                renderList(AppState.activeList, currentProducts);
-            }
-        );
+        liveListen('Kategorien', collection(db, "lists", listId, "categories"), (snap) => {
+            AppState.customCategories = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+            renderCategoryChips();
+            renderList();
+        });
+        liveListen('Ausgeblendet', collection(db, "lists", listId, "hiddenCategories"), (snap) => {
+            AppState.hiddenDefaultCategories = snap.docs.map(d => d.id);
+            renderCategoryChips();
+        });
     }
 
     const urlParams = new URLSearchParams(window.location.search);
@@ -2053,11 +1935,28 @@ if (isListPage) {
     }
 
     if (currentListId) {
-        AppState.loadCategorySettings(currentListId).then(() => {
-            renderCategoryChips();
-            subscribeToList(currentListId);
-        });
+        renderCategoryChips();
+        subscribeToList(currentListId);
     }
+
+    // ===== SPRACHEINGABE =====
+    initVoice({
+        getListId: () => currentListId,
+        getProducts: () => currentProducts,
+        getCategories: () => AppState.getCategories(),
+        getKnownNames: () => [...new Set(allProducts.map(p => p.name).filter(Boolean))].slice(-150),
+        getFamilyId: () => currentFamilyId,
+        detectCategory,
+        addProduct: (name, category, qty) => AppState.addProduct(currentListId, name, category || 'sonstiges', null, { qty, source: 'sprache' }),
+        updateProduct: (id, fields) => AppState.updateProduct(currentListId, id, fields),
+        removeProducts: (ids) => AppState.removeProducts(currentListId, ids, 'sprache'),
+        restoreProducts: (ids) => AppState.restoreProducts(currentListId, ids),
+        showUndo,
+        showToast,
+        askConfirm,
+        getIdToken,
+        log: (label, e) => Debug.log(label, e)
+    });
 
     document.getElementById('addProductBtn').addEventListener('click', addProduct);
     productInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') addProduct(); });
@@ -2082,11 +1981,9 @@ if (isListPage) {
         showModal('editCategoriesModal');
     });
 
-    document.getElementById('recentlyDeletedAction').addEventListener('click', async () => {
+    document.getElementById('recentlyDeletedAction').addEventListener('click', () => {
         hideModal('menuModal');
-        await AppState.cleanExpiredDeletedProducts(currentListId);
-        const items = await AppState.getRecentlyDeletedProducts(currentListId);
-        renderRecentlyDeleted(items);
+        renderRecentlyDeleted();
         showModal('recentlyDeletedModal');
     });
 
@@ -2094,11 +1991,13 @@ if (isListPage) {
         hideModal('recentlyDeletedModal');
     });
 
-    document.getElementById('addCategoryBtn').addEventListener('click', async () => {
+    document.getElementById('backupAction')?.addEventListener('click', () => { hideModal('menuModal'); runBackupDownload(); });
+
+    document.getElementById('addCategoryBtn').addEventListener('click', () => {
         const input = document.getElementById('newCategoryName');
         const name = input.value.trim();
         if (!name) { input.focus(); return; }
-        await AppState.addCustomCategory(currentListId, name, '🏷️');
+        AppState.addCustomCategory(currentListId, name, '🏷️');
         input.value = '';
         renderCategoryChips();
         renderEditCategories();
@@ -2119,17 +2018,6 @@ if (isListPage) {
     document.getElementById('cancelCamera').addEventListener('click', () => hideModal('cameraModal'));
     document.getElementById('galleryAction').addEventListener('click', () => { hideModal('cameraModal'); fileInput.click(); });
     document.getElementById('photoAction').addEventListener('click', () => { hideModal('cameraModal'); cameraInput.click(); });
-
-    function showToast(message, duration = 3000) {
-        const existing = document.getElementById('app-toast');
-        if (existing) existing.remove();
-        const toast = document.createElement('div');
-        toast.id = 'app-toast';
-        toast.textContent = message;
-        toast.style.cssText = 'position:fixed;bottom:110px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.8);color:#fff;padding:12px 20px;border-radius:20px;font-size:14px;z-index:9999;text-align:center;max-width:80%;pointer-events:none;';
-        document.body.appendChild(toast);
-        setTimeout(() => toast.remove(), duration);
-    }
 
     // ===== BARCODE SCANNER =====
     // ZXing (~300 kB) nur nachladen, wenn der native BarcodeDetector fehlt
@@ -2373,7 +2261,8 @@ if (isListPage) {
         if (!file) return;
         const reader = new FileReader();
         reader.onload = async (e) => {
-            const resized = await resizeImage(e.target.result);
+            // Klein halten: Fotos liegen in Firestore (Spark-Tarif, kein Storage)
+            const resized = await resizeImage(e.target.result, 640);
             pendingImageBase64 = resized;
             document.getElementById('previewImg').src = resized;
             showModal('imagePreviewModal');
@@ -2391,10 +2280,10 @@ if (isListPage) {
         cameraInput.value = '';
     });
 
-    document.getElementById('confirmImageProduct').addEventListener('click', async () => {
+    document.getElementById('confirmImageProduct').addEventListener('click', () => {
         const name = document.getElementById('imageProductName').value.trim();
         if (!name) { document.getElementById('imageProductName').focus(); return; }
-        await AppState.addProduct(currentListId, name, selectedCategory, pendingImageBase64);
+        AppState.addProduct(currentListId, name, selectedCategory, pendingImageBase64);
         hideModal('imagePreviewModal');
         pendingImageBase64 = null;
         fileInput.value = '';
@@ -2416,9 +2305,13 @@ if (isListPage) {
 
     document.getElementById('cancelRename').addEventListener('click', () => hideModal('renameModal'));
 
-    document.getElementById('confirmRename').addEventListener('click', async () => {
+    document.getElementById('confirmRename').addEventListener('click', () => {
         const newName = document.getElementById('renameInput').value.trim();
-        if (currentListId && newName) await AppState.renameList(currentListId, newName);
+        if (currentListId && newName) {
+            AppState.renameList(currentListId, newName);
+            if (AppState.activeList) AppState.activeList.name = newName;
+            setTitle();
+        }
         hideModal('renameModal');
     });
 
@@ -2426,52 +2319,40 @@ if (isListPage) {
         if (e.key === 'Enter') document.getElementById('confirmRename').click();
     });
 
-    document.getElementById('clearListAction').addEventListener('click', () => {
+    document.getElementById('clearListAction').addEventListener('click', async () => {
         hideModal('menuModal');
-        document.getElementById('confirmTitle').textContent = 'Alle löschen?';
-        document.getElementById('confirmMessage').textContent = 'Alle Produkte werden unwiderruflich gelöscht.';
-        document.getElementById('confirmAction').textContent = 'Alle löschen';
-        confirmCallback = async () => { if (currentListId) await AppState.clearProducts(currentListId); };
-        showModal('confirmModal');
+        const ids = currentProducts.map(p => p.id);
+        const listName = AppState.activeList?.name || 'Einkaufsliste';
+        if (!ids.length) { showToast('Die Liste ist schon leer'); return; }
+        const ok = await askConfirm({
+            title: 'Alle Produkte entfernen?',
+            message: `${ids.length} ${ids.length === 1 ? 'Produkt' : 'Produkte'} aus „${listName}“ entfernen? Sie bleiben ${PRODUCT_TRASH_DAYS} Tage unter „Zuletzt gelöscht“.`,
+            confirmText: 'Alle entfernen'
+        });
+        if (!ok) return;
+        AppState.removeProducts(currentListId, ids, 'alle-loeschen');
+        showUndo(`${ids.length} Produkte entfernt`, () => AppState.restoreProducts(currentListId, ids));
     });
 
-    document.getElementById('deleteListAction').addEventListener('click', () => {
+    document.getElementById('deleteListAction').addEventListener('click', async () => {
         hideModal('menuModal');
-        document.getElementById('confirmTitle').textContent = 'Liste löschen?';
-        document.getElementById('confirmMessage').textContent = 'Die Liste und alle Produkte werden unwiderruflich gelöscht.';
-        document.getElementById('confirmAction').textContent = 'Löschen';
-        confirmCallback = async () => {
-            if (currentListId) {
-                try { await AppState.deleteList(currentListId); } catch (e) {}
-                window.location.href = 'index.html';
-            }
-        };
-        showModal('confirmModal');
-    });
-
-    document.getElementById('cancelConfirm').addEventListener('click', () => {
-        hideModal('confirmModal'); confirmCallback = null;
-    });
-
-    document.getElementById('confirmAction').addEventListener('click', async () => {
-        if (confirmCallback) { await confirmCallback(); confirmCallback = null; }
-        hideModal('confirmModal');
+        const listName = AppState.activeList?.name || 'Einkaufsliste';
+        const ok = await askConfirm({
+            title: 'Liste löschen?',
+            message: `„${listName}“ mit ${currentProducts.length} Produkten kommt in den Papierkorb und kann ${LIST_TRASH_DAYS} Tage lang wiederhergestellt werden.`,
+            confirmText: 'In den Papierkorb'
+        });
+        if (!ok || !currentListId) return;
+        AppState.deleteList(currentListId);
+        sessionStorage.setItem('undoListDelete', JSON.stringify({ id: currentListId, name: listName }));
+        window.location.href = 'index.html';
     });
 
     document.querySelectorAll('.modal-overlay').forEach(overlay => {
-        overlay.addEventListener('click', async (e) => {
-            if (e.target === overlay) {
-                hideAllModals();
-                confirmCallback = null;
-            }
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) hideAllModals();
         });
     });
 }
 
 } // end auth check
-
-if ('serviceWorker' in navigator) {
-    window.addEventListener('load', () => {
-        navigator.serviceWorker.register('sw.js').catch(() => {});
-    });
-}

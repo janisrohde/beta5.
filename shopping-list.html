@@ -2,6 +2,7 @@
 <html lang="de">
 <head>
     <meta charset="UTF-8">
+    <meta name="app-version" content="2.0.0">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="default">
@@ -11,7 +12,7 @@
     <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
     <link rel="icon" type="image/png" sizes="16x16" href="favicon-16.png">
     <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
-    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="style.css?v=2.0.0">
 </head>
 <body>
     <div class="app-container list-view" style="padding-top:calc(env(safe-area-inset-top,0px) + 16px)">
@@ -31,6 +32,7 @@
                 </svg>
             </button>
         </header>
+        <p class="sync-hint" id="syncHint">Gespeicherter Stand – wird synchronisiert …</p>
         <span class="progress" aria-hidden="true"><span class="progress-fill" id="progressBar" style="width:0%"></span></span>
 
         <main class="list-content">
@@ -58,13 +60,6 @@
                             <path d="M3 5v14M7 5v14M11 5v14M15 5v8M19 5v8M15 17v2M19 17v2"/>
                         </svg>
                         Barcode
-                    </button>
-                    <button class="tool-chip" id="voiceFabChip">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
-                            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/>
-                        </svg>
-                        Sprache
                     </button>
                 </div>
                 <!-- Kategorien mit Bearbeiten-Button -->
@@ -199,7 +194,11 @@
                     <polyline points="1 4 1 10 7 10"></polyline>
                     <path d="M3.51 15a9 9 0 1 0 .49-4.92"></path>
                 </svg>
-                Zuletzt gelöscht
+                Zuletzt gelöscht (7 Tage)
+            </button>
+            <button class="action-sheet-item" id="backupAction">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                Sicherung herunterladen
             </button>
             <button class="action-sheet-item" id="clearListAction">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -278,18 +277,6 @@
     </div>
 
     <!-- Bestätigung -->
-    <div class="modal-overlay" id="confirmModal">
-        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
-            <div class="modal-header"><h2 id="confirmTitle">Bestätigung</h2></div>
-            <div class="modal-body"><p id="confirmMessage">Bist du sicher?</p></div>
-            <div class="modal-footer">
-                <button class="btn btn-cancel" id="cancelConfirm">Abbrechen</button>
-                <button class="btn btn-danger" id="confirmAction">Löschen</button>
-            </div>
-        </div>
-    </div>
-
-    <!-- ZXing wird nur bei Bedarf (Barcode-Scan ohne nativen BarcodeDetector) nachgeladen, siehe script.js -->
-    <script type="module" src="script.js"></script>
+    <script type="module" src="script.js?v=2.0.0"></script>
 </body>
 </html>
