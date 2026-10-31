@@ -601,6 +601,14 @@ function detectCategory(productName) {
     return 'sonstiges';
 }
 
+// Produktzähler am Listen-Dokument – bewusst getrennt vom Produkt-Schreibvorgang,
+// damit ein Produkt nie verloren geht, nur weil der Zähler nicht passt.
+// Falsche Zähler repariert die Listenseite selbst (siehe applyProducts).
+function bumpCount(listId, n) {
+    updateDoc(doc(db, "lists", listId), { productCount: increment(n) })
+        .catch(e => Debug.log('Zähler', e));
+}
+
 // ===== APP STATE =====
 const PRODUCT_TRASH_DAYS = 7;
 const LIST_TRASH_DAYS = 30;
@@ -673,9 +681,9 @@ const AppState = {
         };
         const batch = writeBatch(db);
         batch.set(ref, list);
-        commitQuietly(batch, 'Liste anlegen');
+        const saved = batch.commit().catch(e => Debug.log('Liste anlegen', e));
         this.setActiveList(ref.id);
-        return ref.id;
+        return { id: ref.id, saved };
     },
 
     renameList(id, newName) {
@@ -721,8 +729,8 @@ const AppState = {
         if (isDataImage) {
             batch.set(doc(db, "lists", listId, "productImages", ref.id), { data: imageUrl, createdAt: serverTimestamp() });
         }
-        batch.update(doc(db, "lists", listId), { productCount: increment(1) });
         commitQuietly(batch, 'Produkt hinzufügen');
+        bumpCount(listId, 1);
         return ref.id;
     },
 
@@ -740,16 +748,16 @@ const AppState = {
             deletedReason: reason,
             deletedBy: currentUsername || null
         }));
-        batch.update(doc(db, "lists", listId), { productCount: increment(-ids.length) });
         commitQuietly(batch, 'Produkte entfernen');
+        bumpCount(listId, -ids.length);
     },
 
     restoreProducts(listId, ids) {
         if (!ids.length) return;
         const batch = writeBatch(db);
         ids.forEach(id => batch.update(doc(db, "lists", listId, "products", id), { deletedAt: null }));
-        batch.update(doc(db, "lists", listId), { productCount: increment(ids.length) });
         commitQuietly(batch, 'Produkte wiederherstellen');
+        bumpCount(listId, ids.length);
     },
 
     async loadImage(listId, product) {
@@ -1475,10 +1483,12 @@ if (isHomePage) {
 
     document.getElementById('cancelNewList').addEventListener('click', () => hideModal('newListModal'));
 
-    document.getElementById('confirmNewList').addEventListener('click', () => {
+    document.getElementById('confirmNewList').addEventListener('click', async () => {
         const name = listNameInput.value.trim() || 'Einkaufsliste';
-        const id = AppState.createList(name);
+        const { id, saved } = AppState.createList(name);
         hideModal('newListModal');
+        // Kurz warten, bis der Server die neue Liste hat (offline höchstens 2 s)
+        await Promise.race([saved, new Promise(r => setTimeout(r, 2000))]);
         window.location.href = `shopping-list.html?list=${encodeURIComponent(id)}&new=1`;
     });
 
