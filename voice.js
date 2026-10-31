@@ -1,6 +1,6 @@
 // Spracheingabe für jede Liste: aufnehmen → verstehen (Worker-KI-Kette) → Chips → übernehmen.
 // Ohne Worker oder ohne Internet: Live-Text + lokaler Parser, nur als Vorschlag mit Bestätigung.
-import { parseLocally } from './voice-parser.js?v=2.0.4';
+import { parseLocally } from './voice-parser.js?v=2.0.5';
 
 // Adresse des eigenen Cloudflare Workers (Gratis-Tarif). Leer = nur lokaler Notfall-Parser.
 export const VOICE_WORKER_URL = 'https://einkaufsliste-sprache.janis-rohde.workers.dev';

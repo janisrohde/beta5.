@@ -3,7 +3,7 @@
 // - CSS/JS/Bilder: versioniert (?v=…) aus dem Cache
 // - Firestore, Google-Fonts usw. werden nie abgefangen
 // - Updates: die Seite prüft version.json und lädt sich selbst neu (wie Streak-App)
-const VERSION = '2.0.4';
+const VERSION = '2.0.5';
 const CACHE_NAME = 'einkaufsliste-v8-' + VERSION;
 const CORE = [
     './',

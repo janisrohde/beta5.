@@ -18,10 +18,10 @@ import {
     writeBatch,
     increment
 } from "https://www.gstatic.com/firebasejs/13.1.0/firebase-firestore.js";
-import { initVoice } from "./voice.js?v=2.0.4";
-import { photoKey } from "./photo-key.js?v=2.0.4";
+import { initVoice } from "./voice.js?v=2.0.5";
+import { photoKey } from "./photo-key.js?v=2.0.5";
 
-export const APP_VERSION = '2.0.4';
+export const APP_VERSION = '2.0.5';
 
 // Alte, zwischengespeicherte HTML-Seite (vor Version 2) erkennen: Service Worker
 // und Caches einmalig leeren und frisch laden, damit HTML und Skript zusammenpassen.
