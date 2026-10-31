@@ -18,9 +18,9 @@ import {
     writeBatch,
     increment
 } from "https://www.gstatic.com/firebasejs/13.1.0/firebase-firestore.js";
-import { initVoice } from "./voice.js?v=2.0.2";
+import { initVoice } from "./voice.js?v=2.0.3";
 
-export const APP_VERSION = '2.0.2';
+export const APP_VERSION = '2.0.3';
 
 // Alte, zwischengespeicherte HTML-Seite (vor Version 2) erkennen: Service Worker
 // und Caches einmalig leeren und frisch laden, damit HTML und Skript zusammenpassen.
@@ -149,6 +149,16 @@ function tsMillis(v) {
     if (typeof v.toMillis === 'function') return v.toMillis();
     if (typeof v.seconds === 'number') return v.seconds * 1000;
     return new Date(v).getTime() || 0;
+}
+
+// Hinweis „wird synchronisiert“ erst zeigen, wenn die Verbindung länger als 3 s hängt –
+// sonst blitzt er bei jedem Öffnen kurz auf.
+const hintTimers = new WeakMap();
+function setSyncHint(el, show) {
+    if (!el) return;
+    clearTimeout(hintTimers.get(el));
+    if (!show) { el.classList.remove('visible'); return; }
+    hintTimers.set(el, setTimeout(() => el.classList.add('visible'), 3000));
 }
 
 // ===== LETZTER GUTER STAND (localStorage) =====
@@ -1325,7 +1335,7 @@ if (isHomePage) {
         // Leerer Cache-Stand ersetzt nie eine bereits angezeigte Übersicht
         if (fromCache && lists.length === 0 && allLists.length > 0) return;
         applyLists(lists, !fromCache);
-        if (homeStatus) homeStatus.classList.toggle('visible', fromCache);
+        setSyncHint(homeStatus, fromCache);
         if (!fromCache || lists.length) {
             Mirror.set('lists_' + currentFamilyId, lists.map(l => ({
                 ...l, createdAt: tsMillis(l.createdAt), deletedAt: tsMillis(l.deletedAt) || null
@@ -1861,13 +1871,13 @@ if (isListPage) {
             .sort((a, b) => tsMillis(a.addedAt) - tsMillis(b.addedAt));
         // Letzten guten Stand behalten: ein leerer Cache-Stand leert nie die Anzeige
         if (fromCache && active.length === 0 && currentProducts.length > 0) {
-            syncHint?.classList.add('visible');
+            setSyncHint(syncHint, true);
             return;
         }
         allProducts = products;
         currentProducts = active;
         if (!fromCache) serverConfirmed = true;
-        syncHint?.classList.toggle('visible', fromCache);
+        setSyncHint(syncHint, fromCache);
         renderList();
 
         if (!fromCache || active.length) {
@@ -1890,7 +1900,7 @@ if (isListPage) {
         if (mirroredProducts?.length) {
             allProducts = mirroredProducts;
             currentProducts = mirroredProducts.filter(p => !p.deletedAt).sort((a, b) => tsMillis(a.addedAt) - tsMillis(b.addedAt));
-            syncHint?.classList.add('visible');
+            setSyncHint(syncHint, true);
             renderList();
         } else {
             setTitle();

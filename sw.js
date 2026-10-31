@@ -3,7 +3,7 @@
 // - CSS/JS/Bilder: versioniert (?v=…) aus dem Cache
 // - Firestore, Google-Fonts usw. werden nie abgefangen
 // - Kein automatisches skipWaiting: die Seite zeigt „Neue Version – Neu laden“
-const VERSION = '2.0.2';
+const VERSION = '2.0.3';
 const CACHE_NAME = 'einkaufsliste-v8-' + VERSION;
 const CORE = [
     './',
